@@ -122,6 +122,92 @@ order.
 
 Both domains accept `NULL`, as domains do; add `NOT NULL` where a column must carry an id.
 
+## Using the Go library
+
+Reads need nothing special from either domain: `Muid.Scan` takes the raw 12 octets and the
+16-character text alike, and the drivers hand a `muid` column back as 12 octets and a `muid_text`
+column — or `muid_encode(id)` — back as text. Writes are where the domains differ, because
+`Muid.Value` returns the text form, which is what `muid_text` stores and not what `muid` stores.
+So `muid` keeps the storage advantages above at the price of one conversion on every parameter
+passed as a `Muid`, and `muid_text` trades those advantages for Go code that binds ids as they are.
+
+The behavior below was checked on PostgreSQL 18.4 against `jackc/pgx/v5` v5.10.0 and `lib/pq`
+v1.11.1.
+
+A `muid_text` column takes the Go value directly and gives it back:
+
+```go
+id := muid.New()
+
+if _, err := db.ExecContext(ctx,
+    `INSERT INTO tokens (id, body) VALUES ($1, $2)`, id, "signup"); err != nil {
+    return err
+}
+
+var got muid.Muid
+if err := db.QueryRowContext(ctx,
+    `SELECT id FROM tokens WHERE id = $1`, id).Scan(&got); err != nil {
+    return err
+}
+```
+
+The same `INSERT` against the `muid` column fails, and the error says why:
+
+```
+ERROR:  value for domain muid violates check constraint "muid_check"
+```
+
+PostgreSQL read the 16 characters `Value` returned as `bytea` input, which makes 16 octets rather
+than the 12 the domain requires, and the `CHECK` rejected the row. Decode at the SQL boundary
+instead — this form works on every driver tested:
+
+```go
+id := muid.New()
+
+if _, err := db.ExecContext(ctx,
+    `INSERT INTO events (id, body) VALUES (muid_decode($1), $2)`, id, "signup"); err != nil {
+    return err
+}
+
+var got muid.Muid
+if err := db.QueryRowContext(ctx,
+    `SELECT id FROM events WHERE id = muid_decode($1)`, id).Scan(&got); err != nil {
+    return err
+}
+```
+
+Passing the raw octets as `id[:]` is the other option, and it is where the two drivers diverge:
+
+| Parameter for a `muid` column | pgx v5                   | lib/pq, default settings         |
+| ----------------------------- | ------------------------ | -------------------------------- |
+| `muid_decode($1)` with `id`   | works                    | works                            |
+| `$1::bytea` with `id[:]`      | works                    | works                            |
+| `$1` with `id[:]`             | works                    | fails for most ids, see below    |
+| `$1` with `id`                | domain `CHECK` violation | domain `CHECK` violation         |
+
+lib/pq picks its `bytea` parameter encoding from the parameter's type OID, and the OID PostgreSQL
+infers for a `muid` column is the domain's, not `bytea`'s, so with the default
+`binary_parameters=no` the raw octets go out as text. Whether that survives depends on the value:
+most ids trip the server's UTF-8 check — `invalid byte sequence for encoding "UTF8"`, naming
+whichever octets it stopped on — while an id that is both valid UTF-8 and free of any backslash
+for `bytea`'s escape format to consume is accepted and stored correctly, which makes the failure
+look intermittent. The explicit `::bytea` cast puts
+the OID back, and `binary_parameters=yes` on the connection string also makes a plain `$1` work.
+`id[:]` further needs an addressable value — `muid.New()[:]` does not compile.
+
+Two failures do not announce themselves:
+
+- `WHERE id = $1` with a `Muid` against a `muid` column raises nothing and matches nothing. The
+  text is read as `bytea` input here too, giving the same 16 octets, but a comparison resolves to
+  the base type's operator instead of assigning to the domain, so the `CHECK` never runs: nothing
+  rejects the value and nothing equals it. Write `WHERE id = muid_decode($1)`.
+- A column typed `bytea` rather than `muid` accepts that same direct bind and stores the 16 ASCII
+  octets of the text form — `9ys9FwBMWJ822k35` lands as `\x397973394677424d574a3832326b3335`,
+  with no error anywhere. The domain's `CHECK` is what turns that into a rejected row.
+
+pgx v5's native interface (`pgx.Conn`, `pgxpool`) supports `driver.Valuer` and `sql.Scanner` too,
+through its `pgtype.Map`, and behaved the same as `stdlib` in every case above.
+
 ## Function reference
 
 | Function                | Returns       | Volatility                        | Median cost      |
