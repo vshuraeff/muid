@@ -1,9 +1,13 @@
-# muid
+# µID
 
-Compact, time-ordered, self-validating unique identifiers for Go. A muid is 12 bytes wide,
+Compact, time-ordered, self-validating unique identifiers for Go. A µID is 12 bytes wide,
 prints as exactly 16 case-sensitive base62 characters, and sorts in creation order in both
 its binary and its text form — so you can use it as a primary key and still get
 chronological ordering from a plain index scan.
+
+The name is written with the micro sign µ (U+00B5), not the Greek letter μ (U+03BC). Every
+code artifact stays ASCII: the module path `github.com/vshuraeff/muid`, the package `muid`,
+and the `muid` binary.
 
 Throughout, "creation order" means creation order within one generating process, where it is
 exact. Ids from different processes sort by their embedded timestamps, so their relative
@@ -16,9 +20,9 @@ nanosecond sort by a random field that carries no temporal meaning.
 9yrSO26QnToYjAL8
 ```
 
-Those 12 bytes are a 63-bit Unix-nanosecond timestamp, a 16-bit random field, and a 16-bit
-CRC-16/CCITT-FALSE checksum over the other ten bytes. The checksum is what makes a muid
-self-validating: `Parse` rejects a corrupted or mistyped id instead of handing back a
+Those 12 bytes are an unsigned 64-bit Unix-nanosecond timestamp, a 16-bit random field, and
+a 16-bit CRC-16/CCITT-FALSE checksum over the other ten bytes. The checksum is what makes a
+µID self-validating: `Parse` rejects a corrupted or mistyped id instead of handing back a
 plausible-looking wrong one.
 
 Compared with a UUIDv7 it is under half the string length (16 characters against 36),
@@ -60,7 +64,7 @@ fmt.Println(id.IsZero())  // false
 ```go
 id, err := muid.Parse("9yrSO26OoIfbvR9t")
 if errors.Is(err, muid.ErrInvalid) {
-    // wrong length, character outside the alphabet, out of range, or bad checksum
+    // wrong length, character outside the alphabet, or bad checksum
 }
 
 id = muid.MustParse("9yrSO26OoIfbvR9t") // panics instead of returning an error
@@ -87,17 +91,21 @@ reproduces that same order under a binary or code-point collation — PostgreSQL
 index order is whatever that collation defines, so either pin the collation or store the raw
 12 bytes.
 
-### Appending without allocating
+### Appending to a byte buffer
 
 ```go
+buf := make([]byte, 0, 32)
 buf = append(buf, "id="...)
 buf, _ = id.AppendText(buf) // appends the 16 characters, error is always nil
 ```
 
+`AppendText` allocates nothing as long as `buf` has 16 bytes of spare capacity; otherwise the
+underlying `append` grows it as usual.
+
 ### JSON and other text encodings
 
 `Muid` implements `encoding.TextMarshaler` and `*Muid` implements
-`encoding.TextUnmarshaler`, so `encoding/json` encodes a muid as a JSON string and accepts
+`encoding.TextUnmarshaler`, so `encoding/json` encodes a µID as a JSON string and accepts
 it as a JSON map key. Other text formats — YAML, URL query binding, config decoders — work
 the same way in libraries that honor those two interfaces, which most but not all do:
 
@@ -152,44 +160,60 @@ Every entry point that turns outside data into a `Muid` verifies it: `Parse`, `M
 `UnmarshalText`, `UnmarshalBinary`, and `Scan`. A truncated copy-paste, a flipped character,
 a wrong case, or a corrupted blob is rejected with an error wrapping `ErrInvalid` and is
 caught with probability 1 - 2^-16. `UnmarshalBinary` and `Scan` additionally reject binary
-input whose top bit is set, since that cannot be a valid timestamp.
+input whose 96-bit value is at or above 62^16, since such a value has no 16-character text
+form.
 
 Two consequences are worth stating plainly:
 
 - The checksum is deterministic — it is a function of the ten preceding bytes, so it adds
   nothing to uniqueness. Only the timestamp and the random field carry entropy.
-- Not every 12-byte pattern is a muid. The zero value encodes as sixteen `0` characters, but
+- Not every 12-byte pattern is a µID. The zero value encodes as sixteen `0` characters, but
   it is not checksum-valid, so parsing that text fails. Round-tripping is guaranteed for ids
   produced by `New` or accepted by `Parse`, `UnmarshalBinary`, or `Scan`, not for arbitrary
   bytes you construct yourself.
 
 ## Format
 
-| Property         | Value                                                                  |
-| ---------------- | ---------------------------------------------------------------------- |
-| Binary size      | 12 bytes, big-endian                                                   |
-| Significant bits | 95 (the top bit is always zero)                                        |
-| Text length      | exactly 16 characters, left-padded with `0`                            |
-| Alphabet         | `0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz`       |
-| Case             | significant; no aliases and no normalization                           |
-| Time resolution  | nanoseconds, valid through roughly the year 2262                       |
-| Ordering         | binary, text, and numeric order agree; process-local creation order    |
+The normative format specification lives in [SPEC.md](SPEC.md).
+
+| Property        | Value                                                               |
+| --------------- | ------------------------------------------------------------------- |
+| Binary size     | 12 bytes, big-endian                                                |
+| Valid values    | 96-bit values below 62^16 (`0x9a09afbae83050a9de010000`)            |
+| Text length     | exactly 16 characters, left-padded with `0`                         |
+| Alphabet        | `0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz`    |
+| Case            | significant; no aliases and no normalization                        |
+| Time resolution | nanoseconds, through 2321-09-25T13:06:13.925556393Z                 |
+| Ordering        | binary, text, and numeric order agree; process-local creation order |
 
 Bit layout, most significant bit first:
 
-| Bits    | Width | Content                                                        |
-| ------- | ----- | -------------------------------------------------------------- |
-| 95      | 1     | always zero (the sign bit of the `int64` timestamp)             |
-| 94 – 32 | 63    | Unix nanoseconds, matching `time.Time.UnixNano`                 |
+| Bits    | Width | Content                                                                |
+| ------- | ----- | ---------------------------------------------------------------------- |
+| 95 – 32 | 64    | Unix nanoseconds, unsigned; the top bit may be set                     |
 | 31 – 16 | 16    | random field: random at the start of each nanosecond, then incremented |
-| 15 – 0  | 16    | CRC-16/CCITT-FALSE over the first 10 bytes                      |
+| 15 – 0  | 16    | CRC-16/CCITT-FALSE over the first 10 bytes                             |
 
-The text form is the 96-bit value written as a base62 integer, padded to a fixed 16
-characters. Sixteen base62 digits span slightly more than 95 bits, so `Parse` rejects text
-that decodes to 2^95 or above as out of range. Because the alphabet is listed in ASCII order
-and the width is fixed, lexicographic order over the text equals numeric order over the
-value. The 2262 limit is the `UnixNano` range; past it, both the top-bit-zero invariant and
-the ordering assumptions stop holding.
+A µID is valid when its 96-bit value is below 62^16 and its checksum matches. The two
+entry paths enforce that bound differently. The text form is the 96-bit value written as a
+base62 integer padded to a fixed 16 characters, and every 16-character base62 string is
+below 62^16 by construction, so `Parse` needs no range check at all: it validates length,
+alphabet, and checksum. The binary path has no such guarantee and rejects any 12-byte input
+whose value is at or above the bound. Because the alphabet is listed in ASCII order and the
+width is fixed, lexicographic order over the text equals numeric order over the value.
+
+The bound puts the highest representable timestamp at 11099595973925556393 nanoseconds,
+2321-09-25T13:06:13.925556393Z. That exact maximum is only encodable with a random field of
+`0xde00` or below; with a random field of `0xffff` the highest timestamp is one nanosecond
+lower. At the other end, `New` clamps a pre-1970 clock reading to timestamp 0, so the
+timestamp field is never negative.
+
+`Time()` returns a `time.Time` for any µID, but `UnixNano` on that result is only defined
+over its own range, roughly 1678 through 2262. Code that must handle timestamps beyond 2262
+should read the first eight binary bytes as a big-endian `uint64` instead.
+
+These rules are a strict widening of the earlier top-bit-zero, 2^95-bounded format: every
+identifier valid under those rules is still valid and still encodes to the same text.
 
 ## Guarantees
 
@@ -203,7 +227,7 @@ the ordering assumptions stop holding.
   relative ordering also depends on their clocks being in agreement.
 
 That 2^-16 is a deliberate trade. Schemes with a large random component buy longer odds by
-spending bits; muid spends its bits on a nanosecond timestamp, a 16-character text form, and
+spending bits; µID spends its bits on a nanosecond timestamp, a 16-character text form, and
 a checksum instead. Nanosecond timestamps already make same-nanosecond overlap rare between
 processes, and the checksum turns silent corruption into a loud error — which, in practice,
 is the failure that actually happens. If your threat model is many uncoordinated writers
@@ -213,7 +237,7 @@ generating ids at nanosecond alignment, prefer a scheme with a bigger random fie
 
 - **Not a security token.** Within a single nanosecond, the random field is sequential after
   the first value, so given one id the next ones are guessable, and the checksum is
-  computable by anyone. Never use a muid as a session token, password reset key, or
+  computable by anyone. Never use a µID as a session token, password reset key, or
   capability URL — use `crypto/rand` for those.
 - **Nanoseconds are the storage unit, not a guaranteed clock resolution.** The value is as
   precise as `time.Now` on the host, which on many platforms is coarser than a nanosecond;
@@ -223,18 +247,72 @@ generating ids at nanosecond alignment, prefer a scheme with a bigger random fie
 
 ## Comparison
 
-| Scheme  | Bits | String length | Time-sortable      | Self-validating |
-| ------- | ---- | ------------- | ------------------ | --------------- |
-| UUIDv4  | 128  | 36            | no                 | no              |
-| UUIDv7  | 128  | 36            | yes, milliseconds  | no              |
-| ULID    | 128  | 26            | yes, milliseconds  | no              |
-| xid     | 96   | 20            | yes, seconds       | no              |
-| ksuid   | 160  | 27            | yes, seconds       | no              |
-| muid    | 96   | 16            | yes, nanoseconds   | yes, CRC-16     |
+The table compares format definitions — sizes, precision, and what each layout does or does
+not contain. Measured timings, for µID only, follow it.
 
-muid and xid carry the same 96 bits; muid prints them in four fewer characters because
-base62 packs more per character than base32, and it spends 16 of those bits on the checksum
-that the others do not have.
+| Parameter            | µID            | UUIDv4           | UUIDv7              | ULID             | xid                     | ksuid               |
+| -------------------- | -------------- | ---------------- | ------------------- | ---------------- | ----------------------- | ------------------- |
+| Binary size          | 12 bytes       | 16 bytes         | 16 bytes            | 16 bytes         | 12 bytes                | 20 bytes            |
+| Text length          | 16             | 36               | 36                  | 26               | 20                      | 27                  |
+| Timestamp precision  | nanoseconds    | none             | milliseconds        | milliseconds     | seconds                 | seconds             |
+| Text sorts by time   | yes            | no               | yes                 | yes              | yes                     | yes                 |
+| In-process monotonic | guaranteed     | no               | optional (RFC 9562) | optional (spec)  | counter within a second | optional (Sequence) |
+| Checksum             | CRC-16         | none             | none                | none             | none                    | none                |
+| Host/process field   | none           | none             | none                | none             | machine id + pid        | none                |
+| Case handling        | case-sensitive | case-insensitive | case-insensitive    | case-insensitive | case-sensitive          | case-sensitive      |
+| Upper time bound     | 2321           | n/a              | 10889               | 10889            | 2106                    | 2150                |
+
+Where the six do not differ: all are fixed-width, and all encode to characters that need no
+escaping in a URL, a filename, or a shell word. None of them needs a central allocator or a
+registry.
+
+Reading the differences:
+
+- 16 characters is the shortest text form of the six, and 12 bytes ties xid for the smallest
+  binary form. µID and xid occupy the same 96 physical bits; µID prints them in four fewer
+  characters because base62 packs more per character than base32, which works only because
+  the format restricts values to below 62^16 — 16 base62 digits span about 95.3 bits. It
+  spends 16 of those bits on the checksum that the others do not have.
+- Only µID timestamps to the nanosecond. The millisecond and second formats put far more
+  ids into one indistinguishable time bucket, where their ordering falls back to a counter or
+  to random bits.
+- The monotonic row counts what each format's specification or reference implementation
+  offers. µID's monotonicity is not an option: `New` is serialized, so it is strictly
+  increasing within one process even across a clock rollback (see
+  [Guarantees](#guarantees)). UUIDv7 (RFC 9562 counter methods), ULID (the spec's monotonic
+  mode) and ksuid (the reference package's `Sequence`, sorted until its 65536-value sequence
+  is exhausted) all offer monotonic generation as an opt-in a given library may or may not
+  implement.
+- The CRC-16 is the only integrity check in the table. None of the other formats carries a
+  general typo-detecting checksum: a few mutations are caught incidentally — a character
+  outside the alphabet anywhere, a ULID whose leading character overflows 128 bits, a bad
+  UUID version or variant nibble in a strict parser — but most single-character mutations
+  decode as a different, equally valid id. With µID they yield an error.
+- Embedding no host or process identity means there is nothing to configure and nothing to
+  leak; the price is that cross-process uniqueness is probabilistic, which the
+  [Guarantees](#guarantees) section states in full.
+- Case sensitivity means one text spelling per value: µID has no aliases and no
+  normalization, so `Parse(s).String() == s` and two equal ids are always equal as text. UUID
+  hex and ULID's Crockford base32 are case-insensitive, so one value has several spellings
+  that a byte-wise comparison or a text index treats as different.
+- The 2321 bound is µID's weakest number in the table: UUIDv7 and ULID reach far past it
+  with their 48-bit millisecond timestamps, though xid and ksuid stop earlier.
+- µID depends only on the standard library — its `go.mod` has no `require` block.
+
+Measured on an Intel Core i9-9900K, Go 1.26, `darwin/amd64`, via
+`go test -bench=Benchmark -benchmem -run=NoTests -count=3 .`:
+
+| Operation                            | Time    | Allocations |
+| ------------------------------------ | ------- | ----------- |
+| `New`                                | ~92 ns  | 0           |
+| `New`, 16 goroutines (`RunParallel`) | ~121 ns | 0           |
+| `Parse`                              | ~39 ns  | 0           |
+| `String`                             | ~198 ns | 1 (16 B)    |
+
+The single allocation in `String` is the returned string; `AppendText` writes the same 16
+characters into a caller-owned buffer and allocates nothing when that buffer has 16 bytes of
+spare capacity. No timings are given for the other schemes: they were not measured on this
+machine, and numbers taken from someone else's hardware would not be comparable to these.
 
 ## Command line
 
