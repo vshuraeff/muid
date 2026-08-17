@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -104,7 +105,11 @@ func TestRunDecode(t *testing.T) {
 	}
 
 	timestamp := id.Time()
-	wantTime := fmt.Sprintf("time: %s (unix_ns: %d)", timestamp.UTC().Format(time.RFC3339Nano), binary.BigEndian.Uint64(raw[:8]))
+	unixNS, err := strconv.ParseUint(hex.EncodeToString(raw[:8]), 16, 64)
+	if err != nil {
+		t.Fatalf("ParseUint() error = %v", err)
+	}
+	wantTime := fmt.Sprintf("time: %s (unix_ns: %d)", timestamp.UTC().Format(time.RFC3339Nano), unixNS)
 	if got := lines[1]; got != wantTime {
 		t.Errorf("time line = %q, want %q", got, wantTime)
 	}
@@ -118,29 +123,31 @@ func TestRunDecode(t *testing.T) {
 
 func TestRunDecodeLargeTimestamp(t *testing.T) {
 	tests := []struct {
-		name   string
-		id     string
-		rawHex string
-		unixNS uint64
+		name     string
+		id       string
+		rawHex   string
+		unixNS   uint64
+		wantTime string
 	}{
 		{
-			name:   "two to the 63 nanoseconds",
-			id:     "pWE94k9hlxnYxozN",
-			rawHex: "80000000000000000000050d",
-			unixNS: 9223372036854775808,
+			name:     "two to the 63 nanoseconds",
+			id:       "pWE94k9hlxnYxozN",
+			rawHex:   "80000000000000000000050d",
+			unixNS:   9223372036854775808,
+			wantTime: "2262-04-11T23:47:16.854775808Z",
 		},
 		{
-			name:   "post UnixNano range",
-			id:     "zzzzzzzzzzvvvln8",
-			rawHex: "9a09afbae83050a8ffff6f0a",
-			unixNS: 11099595973925556392,
+			name:     "post UnixNano range",
+			id:       "zzzzzzzzzzvvvln8",
+			rawHex:   "9a09afbae83050a8ffff6f0a",
+			unixNS:   11099595973925556392,
+			wantTime: "2321-09-25T13:06:13.925556392Z",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			id, err := muid.Parse(test.id)
-			if err != nil {
+			if _, err := muid.Parse(test.id); err != nil {
 				t.Fatalf("Parse(%q) error = %v", test.id, err)
 			}
 			raw, err := hex.DecodeString(test.rawHex)
@@ -164,8 +171,7 @@ func TestRunDecodeLargeTimestamp(t *testing.T) {
 				t.Errorf("id line = %q, want %q", got, want)
 			}
 
-			timestamp := id.Time()
-			wantTime := fmt.Sprintf("time: %s (unix_ns: %d)", timestamp.UTC().Format(time.RFC3339Nano), test.unixNS)
+			wantTime := fmt.Sprintf("time: %s (unix_ns: %d)", test.wantTime, test.unixNS)
 			if got := lines[1]; got != wantTime {
 				t.Errorf("time line = %q, want %q", got, wantTime)
 			}
@@ -188,8 +194,8 @@ func TestRunInvalidDecode(t *testing.T) {
 	if stderr.Len() == 0 {
 		t.Fatal("stderr is empty")
 	}
-	if stdout.Len() != 0 || strings.Contains(stdout.String(), "id:") {
-		t.Fatalf("stdout = %q, want no decoded ID", stdout.String())
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 }
 
