@@ -35,7 +35,7 @@ var (
 func TestKnownVectors(t *testing.T) {
 	for _, vector := range []struct {
 		name     string
-		ts       int64
+		ts       uint64
 		rnd      uint16
 		wantHex  string
 		wantText string
@@ -48,11 +48,25 @@ func TestKnownVectors(t *testing.T) {
 			wantText: "0000000000000Ezx",
 		},
 		{
-			name:     "maximum values",
+			name:     "previous upper timestamp",
 			ts:       math.MaxInt64,
 			rnd:      math.MaxUint16,
 			wantHex:  "7fffffffffffffffffff42d5",
 			wantText: "pWE94k9hlxnYxc3R",
+		},
+		{
+			name:     "top-bit timestamp",
+			ts:       uint64(1) << 63,
+			rnd:      0,
+			wantHex:  "80000000000000000000050d",
+			wantText: "pWE94k9hlxnYxozN",
+		},
+		{
+			name:     "maximum timestamp with rnd=0xffff",
+			ts:       11_099_595_973_925_556_392,
+			rnd:      math.MaxUint16,
+			wantHex:  "9a09afbae83050a8ffff6f0a",
+			wantText: "zzzzzzzzzzvvvln8",
 		},
 	} {
 		t.Run(vector.name, func(t *testing.T) {
@@ -73,7 +87,89 @@ func TestKnownVectors(t *testing.T) {
 			if gotText, wantText := got.String(), referenceString(want); gotText != wantText {
 				t.Fatalf("String() = %q, reference = %q", gotText, wantText)
 			}
+			parsed, err := Parse(vector.wantText)
+			if err != nil {
+				t.Fatalf("Parse(%q) error = %v", vector.wantText, err)
+			}
+			if parsed != got {
+				t.Fatalf("Parse(%q) = %x, want %x", vector.wantText, parsed, got)
+			}
 		})
+	}
+}
+
+func TestMaxValidPlusOne(t *testing.T) {
+	bound := new(big.Int).Exp(big.NewInt(62), big.NewInt(textLength), nil)
+	if bound.BitLen() > 96 {
+		t.Fatalf("62^16 bit length = %d, want at most 96", bound.BitLen())
+	}
+
+	var want [12]byte
+	bound.FillBytes(want[:])
+	if maxValidPlusOne != want {
+		t.Fatalf("maxValidPlusOne = %x, want %x", maxValidPlusOne, want)
+	}
+}
+
+func TestMaximumTimestampWithMaxRandom(t *testing.T) {
+	const wantTimestamp uint64 = 11_099_595_973_925_556_392
+
+	bound := new(big.Int).Exp(big.NewInt(62), big.NewInt(textLength), nil)
+	limit := new(big.Int).Sub(bound, big.NewInt(1))
+	randomPart := new(big.Int).Lsh(new(big.Int).SetUint64(math.MaxUint16), 16)
+	candidate := limit.Sub(limit, randomPart)
+	candidate.Rsh(candidate, 32)
+
+	for {
+		if candidate.BitLen() > 64 {
+			t.Fatalf("candidate timestamp has %d bits, want at most 64", candidate.BitLen())
+		}
+		fixture := referenceMuid(candidate.Uint64(), math.MaxUint16)
+		if new(big.Int).SetBytes(fixture[:]).Cmp(bound) < 0 {
+			ts := candidate.Uint64()
+			if ts != wantTimestamp {
+				t.Fatalf("maximum timestamp with rnd=0xffff = %d, want %d", ts, wantTimestamp)
+			}
+
+			got := newMuid(ts, math.MaxUint16)
+			if got != fixture {
+				t.Fatalf("newMuid() = %x, want %x", got, fixture)
+			}
+			if gotText, wantText := got.String(), referenceString(fixture); gotText != wantText {
+				t.Fatalf("String() = %q, reference = %q", gotText, wantText)
+			}
+			parsed, err := Parse(got.String())
+			if err != nil {
+				t.Fatalf("Parse(String()) error = %v", err)
+			}
+			if parsed != got {
+				t.Fatalf("Parse(String()) = %x, want %x", parsed, got)
+			}
+			var fromBinary Muid
+			if err := fromBinary.UnmarshalBinary(got[:]); err != nil {
+				t.Fatalf("UnmarshalBinary() error = %v", err)
+			}
+			if fromBinary != got {
+				t.Fatalf("UnmarshalBinary() = %x, want %x", fromBinary, got)
+			}
+			var fromScan Muid
+			if err := fromScan.Scan(got[:]); err != nil {
+				t.Fatalf("Scan() error = %v", err)
+			}
+			if fromScan != got {
+				t.Fatalf("Scan() = %x, want %x", fromScan, got)
+			}
+
+			next := newMuid(ts+1, math.MaxUint16)
+			if new(big.Int).SetBytes(next[:]).Cmp(bound) < 0 {
+				t.Fatalf("next timestamp value = %x, want at least 62^16", next)
+			}
+			if err := fromBinary.UnmarshalBinary(next[:]); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("UnmarshalBinary(next timestamp) error = %v, want ErrInvalid", err)
+			}
+			return
+		}
+		candidate.Sub(candidate, big.NewInt(1))
 	}
 }
 
@@ -91,7 +187,7 @@ func TestCRCCheckValue(t *testing.T) {
 func TestReferenceAlgorithms(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	for range 1000 {
-		ts := rng.Int63()
+		ts := uint64(rng.Int63())
 		rnd := uint16(rng.Uint32())
 		fixture := referenceMuid(ts, rnd)
 		production := newMuid(ts, rnd)
@@ -261,10 +357,18 @@ func TestNewStringAndMustParse(t *testing.T) {
 }
 
 func TestTimeAndIsZero(t *testing.T) {
-	const ns int64 = 1_726_000_000_123_456_789
-	if got, want := newMuid(ns, 0).Time(), time.Unix(0, ns); !got.Equal(want) {
+	const ns uint64 = 1_726_000_000_123_456_789
+	if got, want := newMuid(ns, 0).Time(), time.Unix(int64(ns/1_000_000_000), int64(ns%1_000_000_000)); !got.Equal(want) {
 		t.Fatalf("Time() = %v, want %v", got, want)
 	}
+
+	t.Run("above MaxInt64", func(t *testing.T) {
+		ts := uint64(1<<63) + 12_345
+		want := time.Unix(int64(ts/1_000_000_000), int64(ts%1_000_000_000)).UTC()
+		if got := newMuid(ts, 0).Time().UTC(); !got.Equal(want) {
+			t.Fatalf("Time() = %v, want %v", got, want)
+		}
+	})
 	if !(Muid{}).IsZero() {
 		t.Fatal("zero Muid IsZero() = false, want true")
 	}
@@ -285,7 +389,7 @@ func TestParseRejection(t *testing.T) {
 	}
 
 	assertChecksumMismatch(t, strings.Repeat("0", textLength))
-	assertInvalid(t, strings.Repeat("z", textLength), "overflow")
+	assertChecksumMismatch(t, strings.Repeat("z", textLength))
 
 	corrupt := newMuid(9876, 0xabcd)
 	corrupt[10] ^= 1
@@ -323,11 +427,19 @@ func TestUnmarshalBinaryAndScanRejection(t *testing.T) {
 	}
 
 	valid := newMuid(123, 456)
-	topBitSet := valid
-	topBitSet[0] |= 0x80
 	var m Muid
-	if err := m.UnmarshalBinary(topBitSet[:]); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("UnmarshalBinary(top-bit-set data) error = %v, want ErrInvalid", err)
+	bound := maxValidPlusOne
+	allOnes := Muid{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	for name, data := range map[string][]byte{
+		"bound":    bound[:],
+		"all ones": allOnes[:],
+	} {
+		if err := m.UnmarshalBinary(data); !errors.Is(err, ErrInvalid) {
+			t.Errorf("UnmarshalBinary(%s) error = %v, want ErrInvalid", name, err)
+		}
+		if err := m.Scan(data); !errors.Is(err, ErrInvalid) {
+			t.Errorf("Scan(%s) error = %v, want ErrInvalid", name, err)
+		}
 	}
 	badCRC := valid
 	badCRC[11] ^= 1
@@ -359,7 +471,7 @@ func TestOrdering(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(2))
 	for range 1000 {
-		ts1, ts2 := rng.Int63(), rng.Int63()
+		ts1, ts2 := uint64(rng.Int63()), uint64(rng.Int63())
 		if ts1 == ts2 {
 			ts2++
 		}
@@ -369,7 +481,7 @@ func TestOrdering(t *testing.T) {
 		if got, want := sign(m1.Compare(m2)), sign(strings.Compare(m1.String(), m2.String())); got != want {
 			t.Fatalf("binary ordering = %d, text ordering = %d for %x and %x", got, want, m1, m2)
 		}
-		if got, want := sign(m1.Compare(m2)), sign(compareInt64(ts1, ts2)); got != want {
+		if got, want := sign(m1.Compare(m2)), sign(compareUint64(ts1, ts2)); got != want {
 			t.Fatalf("identifier ordering = %d, timestamp ordering = %d for %d and %d", got, want, ts1, ts2)
 		}
 	}
@@ -391,11 +503,11 @@ func TestGeneratorMonotonicity(t *testing.T) {
 		t.Fatalf("backward-time next() = %x / %q, previous = %x / %q", backward, backward.String(), previous, previous.String())
 	}
 
-	last := int64(123)
+	last := uint64(123)
 	g = generator{last: last, rnd: math.MaxUint16}
 	before := newMuid(last, math.MaxUint16)
 	overflow := g.next(last)
-	if got := int64(binary.BigEndian.Uint64(overflow[:8])); got != last+1 {
+	if got := binary.BigEndian.Uint64(overflow[:8]); got != last+1 {
 		t.Fatalf("overflow timestamp = %d, want %d", got, last+1)
 	}
 	if g.last != last+1 {
@@ -403,6 +515,58 @@ func TestGeneratorMonotonicity(t *testing.T) {
 	}
 	if overflow.Compare(before) <= 0 || strings.Compare(overflow.String(), before.String()) <= 0 {
 		t.Fatalf("overflow next() = %x / %q, previous = %x / %q", overflow, overflow.String(), before, before.String())
+	}
+}
+
+func TestGeneratorClampedNegativeTimeRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		in   int64
+		want uint64
+	}{
+		{name: "minimum", in: math.MinInt64, want: 0},
+		{name: "negative", in: -1, want: 0},
+		{name: "zero", in: 0, want: 0},
+		{name: "positive", in: 1, want: 1},
+		{name: "maximum", in: math.MaxInt64, want: uint64(math.MaxInt64)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := clampNanos(test.in); got != test.want {
+				t.Fatalf("clampNanos(%d) = %d, want %d", test.in, got, test.want)
+			}
+		})
+	}
+
+	var g generator
+	clamped := g.next(0)
+	if got := binary.BigEndian.Uint64(clamped[:8]); got != 0 {
+		t.Fatalf("clamped timestamp = %d, want 0", got)
+	}
+	parsed, err := Parse(clamped.String())
+	if err != nil {
+		t.Fatalf("Parse(clamped.String()) error = %v", err)
+	}
+	if parsed != clamped {
+		t.Fatalf("Parse(clamped.String()) = %x, want %x", parsed, clamped)
+	}
+	var fromBinary Muid
+	if err := fromBinary.UnmarshalBinary(clamped[:]); err != nil {
+		t.Fatalf("UnmarshalBinary(clamped) error = %v", err)
+	}
+	if fromBinary != clamped {
+		t.Fatalf("UnmarshalBinary(clamped) = %x, want %x", fromBinary, clamped)
+	}
+
+	const now uint64 = 123
+	recovered := g.next(now)
+	if got := binary.BigEndian.Uint64(recovered[:8]); got != now {
+		t.Fatalf("recovered timestamp = %d, want %d", got, now)
+	}
+	if g.last != now {
+		t.Fatalf("generator last = %d, want %d", g.last, now)
+	}
+	if recovered.Compare(clamped) <= 0 {
+		t.Fatalf("recovered muid = %x, want greater than clamped muid %x", recovered, clamped)
 	}
 }
 
@@ -493,9 +657,9 @@ func BenchmarkParse(b *testing.B) {
 	}
 }
 
-func referenceMuid(ns int64, rnd uint16) Muid {
+func referenceMuid(ns uint64, rnd uint16) Muid {
 	var m Muid
-	binary.BigEndian.PutUint64(m[:8], uint64(ns))
+	binary.BigEndian.PutUint64(m[:8], ns)
 	binary.BigEndian.PutUint16(m[8:10], rnd)
 	binary.BigEndian.PutUint16(m[10:12], referenceCRC16(m[:10]))
 	return m
@@ -571,7 +735,7 @@ func sign(value int) int {
 	}
 }
 
-func compareInt64(left, right int64) int {
+func compareUint64(left, right uint64) int {
 	switch {
 	case left < right:
 		return -1
