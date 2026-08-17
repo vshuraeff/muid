@@ -1,24 +1,24 @@
-// Package muid implements a 96-bit monotonic, sortable opaque identifier.
+// Package muid implements µID, a 96-bit monotonic, sortable opaque identifier.
 // Its 12-byte binary form is an unsigned 64-bit, big-endian Unix-nanoseconds
 // timestamp, followed by a 16-bit random field and a 16-bit CRC-16/CCITT-FALSE
-// checksum over the first 10 bytes. A muid is valid when its 96-bit value is
+// checksum over the first 10 bytes. A µID is valid when its 96-bit value is
 // less than 62^16 and its checksum matches. Its text form is exactly 16
 // case-sensitive base62 characters, fixed-width and left-padded with '0'. Text
 // lexicographic order, numeric order, and binary byte order all equal creation
 // order.
 //
-// Muid is strictly monotonic within one process, including across backward clock
+// µID is strictly monotonic within one process, including across backward clock
 // jumps. Two independently generated ids in the same nanosecond have roughly a
 // 2^-16 collision probability. The checksum detects accidental corruption of
 // parsed text with probability 1 - 2^-16, but provides no uniqueness benefit.
-// Muid is not a security token: values within one nanosecond are sequential after
+// µID is not a security token: values within one nanosecond are sequential after
 // the first random field rather than independently random. Nanoseconds are the
 // storage unit, not a guaranteed clock resolution. Timestamps through roughly
 // the year 2321 are representable. This is a strict widening of the previous
 // 2^95-bounded, top-bit-zero rules: every identifier valid under those rules
 // remains valid and encodes identically.
 //
-// The zero Muid encodes as sixteen '0' characters, but it is not CRC-valid, so
+// The zero µID encodes as sixteen '0' characters, but it is not CRC-valid, so
 // Parse of that text returns a checksum error. String round trips are guaranteed
 // only for ids produced by New or accepted by Parse, UnmarshalBinary, or Scan;
 // arbitrary byte patterns, including the zero value, are not necessarily valid.
@@ -71,10 +71,10 @@ var crcTable = func() [256]uint16 {
 	return table
 }()
 
-// ErrInvalid reports invalid muid text, binary data, or database input.
+// ErrInvalid reports invalid µID text, binary data, or database input.
 var ErrInvalid = errors.New("invalid muid")
 
-// Muid is a 96-bit monotonic, sortable opaque identifier.
+// Muid is the 12-byte binary form of a µID, a 96-bit monotonic, sortable opaque identifier.
 type Muid [12]byte
 
 type generator struct {
@@ -136,7 +136,7 @@ func crc16(data []byte) uint16 {
 	return crc
 }
 
-// Parse parses a 16-character, case-sensitive base62 muid text value.
+// Parse parses a 16-character, case-sensitive base62 µID text value.
 func Parse(s string) (Muid, error) {
 	if len(s) != textLength {
 		return Muid{}, invalid("invalid muid text length")
@@ -166,7 +166,7 @@ func Parse(s string) (Muid, error) {
 	return parsed, nil
 }
 
-// MustParse parses a 16-character muid text value and panics if it is invalid.
+// MustParse parses a 16-character µID text value and panics if it is invalid.
 func MustParse(s string) Muid {
 	m, err := Parse(s)
 	if err != nil {
