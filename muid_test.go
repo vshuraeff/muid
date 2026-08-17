@@ -345,6 +345,10 @@ func TestUnmarshalBinaryAndScanRejection(t *testing.T) {
 	if err := scanned.Scan(badCRC[:]); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("Scan(bad checksum) error = %v, want checksum ErrInvalid", err)
 	}
+	var textScanned Muid
+	if err := textScanned.Scan([]byte("0000000000000000")); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Scan(16-byte text, bad checksum) error = %v, want ErrInvalid", err)
+	}
 }
 
 func TestOrdering(t *testing.T) {
