@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -65,7 +66,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 		timestamp := parsed.Time()
 		fmt.Fprintf(stdout, "id: %s\n", parsed.String())
-		fmt.Fprintf(stdout, "time: %s (unix_ns: %d)\n", timestamp.UTC().Format(time.RFC3339Nano), timestamp.UnixNano())
+		fmt.Fprintf(stdout, "time: %s (unix_ns: %d)\n", timestamp.UTC().Format(time.RFC3339Nano), binary.BigEndian.Uint64(raw[:8]))
 		fmt.Fprintf(stdout, "rand: %s\n", hex.EncodeToString(raw[8:10]))
 		fmt.Fprintf(stdout, "crc: %s\n", hex.EncodeToString(raw[10:12]))
 		return 0

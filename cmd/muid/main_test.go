@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -103,7 +104,7 @@ func TestRunDecode(t *testing.T) {
 	}
 
 	timestamp := id.Time()
-	wantTime := fmt.Sprintf("time: %s (unix_ns: %d)", timestamp.UTC().Format(time.RFC3339Nano), timestamp.UnixNano())
+	wantTime := fmt.Sprintf("time: %s (unix_ns: %d)", timestamp.UTC().Format(time.RFC3339Nano), binary.BigEndian.Uint64(raw[:8]))
 	if got := lines[1]; got != wantTime {
 		t.Errorf("time line = %q, want %q", got, wantTime)
 	}
@@ -112,6 +113,69 @@ func TestRunDecode(t *testing.T) {
 	}
 	if got, want := lines[3], "crc: "+hex.EncodeToString(raw[10:12]); got != want {
 		t.Errorf("crc line = %q, want %q", got, want)
+	}
+}
+
+func TestRunDecodeLargeTimestamp(t *testing.T) {
+	tests := []struct {
+		name   string
+		id     string
+		rawHex string
+		unixNS uint64
+	}{
+		{
+			name:   "two to the 63 nanoseconds",
+			id:     "pWE94k9hlxnYxozN",
+			rawHex: "80000000000000000000050d",
+			unixNS: 9223372036854775808,
+		},
+		{
+			name:   "post UnixNano range",
+			id:     "zzzzzzzzzzvvvln8",
+			rawHex: "9a09afbae83050a8ffff6f0a",
+			unixNS: 11099595973925556392,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			id, err := muid.Parse(test.id)
+			if err != nil {
+				t.Fatalf("Parse(%q) error = %v", test.id, err)
+			}
+			raw, err := hex.DecodeString(test.rawHex)
+			if err != nil {
+				t.Fatalf("DecodeString(%q) error = %v", test.rawHex, err)
+			}
+			if got := binary.BigEndian.Uint64(raw[:8]); got != test.unixNS {
+				t.Fatalf("raw unix nanoseconds = %d, want %d", got, test.unixNS)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{"-d", test.id}, &stdout, &stderr); code != 0 {
+				t.Fatalf("run() exit code = %d, want 0; stderr = %q", code, stderr.String())
+			}
+
+			lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+			if len(lines) != 4 {
+				t.Fatalf("stdout lines = %d, want 4; stdout = %q", len(lines), stdout.String())
+			}
+			if got, want := lines[0], "id: "+test.id; got != want {
+				t.Errorf("id line = %q, want %q", got, want)
+			}
+
+			timestamp := id.Time()
+			wantTime := fmt.Sprintf("time: %s (unix_ns: %d)", timestamp.UTC().Format(time.RFC3339Nano), test.unixNS)
+			if got := lines[1]; got != wantTime {
+				t.Errorf("time line = %q, want %q", got, wantTime)
+			}
+			if got, want := lines[2], "rand: "+hex.EncodeToString(raw[8:10]); got != want {
+				t.Errorf("rand line = %q, want %q", got, want)
+			}
+			if got, want := lines[3], "crc: "+hex.EncodeToString(raw[10:12]); got != want {
+				t.Errorf("crc line = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
