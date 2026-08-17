@@ -20,6 +20,7 @@ import (
 var (
 	benchmarkMuid   Muid
 	benchmarkString string
+	benchmarkMu     sync.Mutex
 
 	_ encoding.TextMarshaler     = Muid{}
 	_ encoding.TextUnmarshaler   = (*Muid)(nil)
@@ -32,198 +33,340 @@ var (
 )
 
 func TestKnownVectors(t *testing.T) {
-	if got, want := (Muid{}).String(), strings.Repeat("0", 19); got != want {
-		t.Fatalf("zero String() = %q, want %q", got, want)
-	}
-
-	if got := testMuid(0, 1).String(); got[len(got)-1] != '1' {
-		t.Fatalf("tail one String() = %q, want final digit 1", got)
-	}
-
-	if got, want := testMuid(math.MaxInt64, math.MaxUint32).String(), strings.Repeat("z", 19); got != want {
-		t.Fatalf("maximum String() = %q, want %q", got, want)
+	for _, vector := range []struct {
+		name     string
+		ts       int64
+		rnd      uint16
+		wantHex  string
+		wantText string
+	}{
+		{
+			name:     "zero timestamp",
+			ts:       0,
+			rnd:      0,
+			wantHex:  "00000000000000000000e139",
+			wantText: "0000000000000Ezx",
+		},
+		{
+			name:     "maximum values",
+			ts:       math.MaxInt64,
+			rnd:      math.MaxUint16,
+			wantHex:  "7fffffffffffffffffff42d5",
+			wantText: "pWE94k9hlxnYxc3R",
+		},
+	} {
+		t.Run(vector.name, func(t *testing.T) {
+			want := referenceMuid(vector.ts, vector.rnd)
+			got := newMuid(vector.ts, vector.rnd)
+			if gotHex := fmt.Sprintf("%x", got[:]); gotHex != vector.wantHex {
+				t.Fatalf("newMuid() hex = %q, want %q", gotHex, vector.wantHex)
+			}
+			if gotText := got.String(); gotText != vector.wantText {
+				t.Fatalf("String() = %q, want %q", gotText, vector.wantText)
+			}
+			if got != want {
+				t.Fatalf("newMuid() = %x, want %x", got, want)
+			}
+			if gotCRC, wantCRC := binary.BigEndian.Uint16(got[10:12]), referenceCRC16(got[:10]); gotCRC != wantCRC {
+				t.Fatalf("stored CRC = %04x, reference CRC = %04x", gotCRC, wantCRC)
+			}
+			if gotText, wantText := got.String(), referenceString(want); gotText != wantText {
+				t.Fatalf("String() = %q, reference = %q", gotText, wantText)
+			}
+		})
 	}
 }
 
-func TestStringReferenceEncoder(t *testing.T) {
+func TestCRCCheckValue(t *testing.T) {
+	const want uint16 = 0x29b1
+	input := []byte("123456789")
+	if got := crc16(input); got != want {
+		t.Fatalf("crc16() = %04x, want %04x", got, want)
+	}
+	if got := referenceCRC16(input); got != want {
+		t.Fatalf("referenceCRC16() = %04x, want %04x", got, want)
+	}
+}
+
+func TestReferenceAlgorithms(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	for range 1000 {
-		m := testMuid(rng.Int63(), rng.Uint32())
-		if got, want := m.String(), referenceString(m); got != want {
-			t.Fatalf("String() = %q, reference = %q for %x", got, want, m)
+		ts := rng.Int63()
+		rnd := uint16(rng.Uint32())
+		fixture := referenceMuid(ts, rnd)
+		production := newMuid(ts, rnd)
+		if production != fixture {
+			t.Fatalf("newMuid(%d, %04x) = %x, want %x", ts, rnd, production, fixture)
+		}
+		if gotCRC, wantCRC := binary.BigEndian.Uint16(production[10:12]), referenceCRC16(fixture[:10]); gotCRC != wantCRC {
+			t.Fatalf("stored CRC = %04x, reference CRC = %04x", gotCRC, wantCRC)
+		}
+		if gotText, wantText := production.String(), referenceString(fixture); gotText != wantText {
+			t.Fatalf("String() = %q, reference = %q for %x", gotText, wantText, fixture)
+		}
+		parsed, err := Parse(referenceString(fixture))
+		if err != nil {
+			t.Fatalf("Parse(reference string) error = %v", err)
+		}
+		if parsed != fixture {
+			t.Fatalf("Parse(reference string) = %x, want %x", parsed, fixture)
 		}
 	}
 }
 
-func TestRoundTrip(t *testing.T) {
-	m := testMuid(1_726_000_000_123_456_789, 0x12345678)
+func TestRoundTrips(t *testing.T) {
+	want := newMuid(1_726_000_000_123_456_789, 0x8765)
 
-	parsed, err := Parse(m.String())
+	parsed, err := Parse(want.String())
 	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
+		t.Fatalf("Parse(String()) error = %v", err)
 	}
-	if parsed != m {
-		t.Fatalf("Parse(String()) = %x, want %x", parsed, m)
-	}
-
-	binaryData, err := m.MarshalBinary()
-	if err != nil {
-		t.Fatalf("MarshalBinary() error = %v", err)
-	}
-	var unmarshaled Muid
-	if err := unmarshaled.UnmarshalBinary(binaryData); err != nil {
-		t.Fatalf("UnmarshalBinary() error = %v", err)
-	}
-	if unmarshaled != m {
-		t.Fatalf("UnmarshalBinary(MarshalBinary()) = %x, want %x", unmarshaled, m)
+	if parsed != want || parsed.String() != want.String() {
+		t.Fatalf("Parse(String()) = %x / %q, want %x / %q", parsed, parsed.String(), want, want.String())
 	}
 
-	text, err := m.AppendText(nil)
+	text, err := want.AppendText([]byte("prefix:"))
 	if err != nil {
 		t.Fatalf("AppendText() error = %v", err)
 	}
-	if got := string(text); got != m.String() {
-		t.Fatalf("AppendText() = %q, want %q", got, m.String())
+	if got, wantText := string(text), "prefix:"+want.String(); got != wantText {
+		t.Fatalf("AppendText() = %q, want %q", got, wantText)
+	}
+
+	binaryData, err := want.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	var fromBinary Muid
+	if err := fromBinary.UnmarshalBinary(binaryData); err != nil {
+		t.Fatalf("UnmarshalBinary() error = %v", err)
+	}
+	if fromBinary != want {
+		t.Fatalf("UnmarshalBinary(MarshalBinary()) = %x, want %x", fromBinary, want)
+	}
+
+	jsonData, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var fromJSON Muid
+	if err := json.Unmarshal(jsonData, &fromJSON); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if fromJSON != want {
+		t.Fatalf("JSON round trip = %x, want %x", fromJSON, want)
+	}
+
+	value, err := want.Value()
+	if err != nil {
+		t.Fatalf("Value() error = %v", err)
+	}
+	var fromValue Muid
+	if err := fromValue.Scan(value); err != nil {
+		t.Fatalf("Scan(Value()) error = %v", err)
+	}
+	if fromValue != want {
+		t.Fatalf("Scan(Value()) = %x, want %x", fromValue, want)
+	}
+
+	var fromTextBytes Muid
+	if err := fromTextBytes.Scan([]byte(want.String())); err != nil {
+		t.Fatalf("Scan([]byte text) error = %v", err)
+	}
+	if fromTextBytes != want {
+		t.Fatalf("Scan([]byte text) = %x, want %x", fromTextBytes, want)
+	}
+
+	var fromRaw Muid
+	if err := fromRaw.Scan(binaryData); err != nil {
+		t.Fatalf("Scan([]byte binary) error = %v", err)
+	}
+	if fromRaw != want {
+		t.Fatalf("Scan([]byte binary) = %x, want %x", fromRaw, want)
 	}
 }
 
-func TestNewString(t *testing.T) {
-	text := NewString()
-	if len(text) != 19 {
-		t.Fatalf("NewString() length = %d, want 19", len(text))
-	}
+func TestReceiverUnchangedOnFailure(t *testing.T) {
+	original := newMuid(1_726_000_000_123_456_789, 0x5678)
+	badText := strings.Repeat("0", textLength)
+	badBinary := original
+	badBinary[11] ^= 1
 
+	t.Run("UnmarshalText", func(t *testing.T) {
+		receiver := original
+		if err := receiver.UnmarshalText([]byte(badText)); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("UnmarshalText() error = %v, want ErrInvalid", err)
+		}
+		if receiver != original {
+			t.Fatalf("receiver = %x after failed UnmarshalText(), want %x", receiver, original)
+		}
+	})
+
+	t.Run("UnmarshalBinary", func(t *testing.T) {
+		receiver := original
+		if err := receiver.UnmarshalBinary(badBinary[:]); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("UnmarshalBinary() error = %v, want ErrInvalid", err)
+		}
+		if receiver != original {
+			t.Fatalf("receiver = %x after failed UnmarshalBinary(), want %x", receiver, original)
+		}
+	})
+
+	t.Run("Scan", func(t *testing.T) {
+		receiver := original
+		if err := receiver.Scan(badText); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("Scan(string) error = %v, want ErrInvalid", err)
+		}
+		if receiver != original {
+			t.Fatalf("receiver = %x after failed Scan(), want %x", receiver, original)
+		}
+	})
+}
+
+func TestNilReceivers(t *testing.T) {
+	var receiver *Muid
+	if err := receiver.UnmarshalText([]byte("invalid")); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nil UnmarshalText() error = %v, want ErrInvalid", err)
+	}
+	if err := receiver.UnmarshalBinary(nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nil UnmarshalBinary() error = %v, want ErrInvalid", err)
+	}
+	if err := receiver.Scan("invalid"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nil Scan() error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestNewStringAndMustParse(t *testing.T) {
+	text := NewString()
+	if len(text) != textLength {
+		t.Fatalf("NewString() length = %d, want %d", len(text), textLength)
+	}
 	parsed, err := Parse(text)
 	if err != nil {
 		t.Fatalf("Parse(NewString()) error = %v", err)
 	}
-	if got := parsed.String(); got != text {
-		t.Fatalf("Parse(NewString()).String() = %q, want %q", got, text)
+	if parsed.String() != text {
+		t.Fatalf("Parse(NewString()).String() = %q, want %q", parsed.String(), text)
 	}
-}
-
-func TestMustParse(t *testing.T) {
-	text := testMuid(123, 456).String()
-	want, err := Parse(text)
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-	if got := MustParse(text); got != want {
-		t.Fatalf("MustParse() = %x, want %x", got, want)
+	if got := MustParse(text); got != parsed {
+		t.Fatalf("MustParse() = %x, want %x", got, parsed)
 	}
 
-	t.Run("panic", func(t *testing.T) {
-		defer func() {
-			if recover() == nil {
-				t.Fatal("MustParse() did not panic for invalid input")
-			}
-		}()
-		MustParse("invalid")
-	})
+	defer func() {
+		if recover() == nil {
+			t.Fatal("MustParse() did not panic for invalid input")
+		}
+	}()
+	MustParse("invalid")
 }
 
 func TestTimeAndIsZero(t *testing.T) {
 	const ns int64 = 1_726_000_000_123_456_789
-	if got, want := testMuid(ns, 0).Time(), time.Unix(0, ns); !got.Equal(want) {
+	if got, want := newMuid(ns, 0).Time(), time.Unix(0, ns); !got.Equal(want) {
 		t.Fatalf("Time() = %v, want %v", got, want)
 	}
-
 	if !(Muid{}).IsZero() {
 		t.Fatal("zero Muid IsZero() = false, want true")
 	}
-	if testMuid(1, 0).IsZero() {
+	if newMuid(1, 0).IsZero() {
 		t.Fatal("non-zero Muid IsZero() = true, want false")
 	}
 }
 
-func TestUnmarshalBinaryRejection(t *testing.T) {
-	for _, length := range []int{0, 11, 13} {
-		var m Muid
-		if err := m.UnmarshalBinary(make([]byte, length)); !errors.Is(err, ErrInvalid) {
-			t.Errorf("UnmarshalBinary(%d bytes) error = %v, want error wrapping ErrInvalid", length, err)
-		}
+func TestParseRejection(t *testing.T) {
+	valid := newMuid(1_726_000_000_123_456_789, 0x1234).String()
+	for _, input := range []string{"", valid[:15], valid + "0"} {
+		assertInvalid(t, input, "wrong length")
 	}
 
-	data := make([]byte, 12)
-	data[0] = 0x80
-	var m Muid
-	if err := m.UnmarshalBinary(data); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("UnmarshalBinary(top-bit-set data) error = %v, want error wrapping ErrInvalid", err)
+	for _, replacement := range []string{" ", "-", string([]byte{0xff}), string([]byte{0})} {
+		input := valid[:7] + replacement + valid[8:]
+		assertInvalid(t, input, "invalid character")
+	}
+
+	assertChecksumMismatch(t, strings.Repeat("0", textLength))
+	assertInvalid(t, strings.Repeat("z", textLength), "overflow")
+
+	corrupt := newMuid(9876, 0xabcd)
+	corrupt[10] ^= 1
+	assertChecksumMismatch(t, corrupt.String())
+}
+
+func TestCaseCorruptionIsNotAnAlias(t *testing.T) {
+	original := newMuid(math.MaxInt64, math.MaxUint16)
+	input, changed := flipLetterCase(original.String())
+	if !changed {
+		t.Fatal("test identifier has no letter to flip")
+	}
+
+	parsed, err := Parse(input)
+	if err != nil {
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("Parse(case-corrupted input) error = %v, want ErrInvalid", err)
+		}
+		if !strings.Contains(err.Error(), "checksum mismatch") {
+			t.Fatalf("Parse(case-corrupted input) error = %v, want checksum mismatch", err)
+		}
+		return
+	}
+	if parsed == original {
+		t.Fatalf("Parse(%q) accepted an equivalent value", input)
 	}
 }
 
-func TestParseCanonicalizationAndRejection(t *testing.T) {
-	lower := "000000000000000000a"
-	upper := "000000000000000000A"
-	lowerMuid, err := Parse(lower)
-	if err != nil {
-		t.Fatalf("Parse(%q) error = %v", lower, err)
-	}
-	upperMuid, err := Parse(upper)
-	if err != nil {
-		t.Fatalf("Parse(%q) error = %v", upper, err)
-	}
-	if lowerMuid != upperMuid {
-		t.Fatalf("uppercase Parse() = %x, lowercase = %x", upperMuid, lowerMuid)
-	}
-
-	one := testMuid(0, 1)
-	for _, input := range []string{"i", "I", "l", "L"} {
-		parsed, err := Parse(strings.Repeat("0", 18) + input)
-		if err != nil {
-			t.Fatalf("Parse(%q) error = %v", input, err)
-		}
-		if parsed != one {
-			t.Fatalf("Parse(%q) = %x, want %x", input, parsed, one)
+func TestUnmarshalBinaryAndScanRejection(t *testing.T) {
+	for _, length := range []int{0, 11, 13} {
+		var m Muid
+		if err := m.UnmarshalBinary(make([]byte, length)); !errors.Is(err, ErrInvalid) {
+			t.Errorf("UnmarshalBinary(%d bytes) error = %v, want ErrInvalid", length, err)
 		}
 	}
 
-	zero := Muid{}
-	for _, input := range []string{"o", "O"} {
-		parsed, err := Parse(input + strings.Repeat("0", 18))
-		if err != nil {
-			t.Fatalf("Parse(%q) error = %v", input, err)
-		}
-		if parsed != zero {
-			t.Fatalf("Parse(%q) = %x, want zero", input, parsed)
-		}
+	valid := newMuid(123, 456)
+	topBitSet := valid
+	topBitSet[0] |= 0x80
+	var m Muid
+	if err := m.UnmarshalBinary(topBitSet[:]); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("UnmarshalBinary(top-bit-set data) error = %v, want ErrInvalid", err)
+	}
+	badCRC := valid
+	badCRC[11] ^= 1
+	if err := m.UnmarshalBinary(badCRC[:]); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("UnmarshalBinary(bad checksum) error = %v, want checksum ErrInvalid", err)
 	}
 
-	invalidInputs := []string{
-		strings.Repeat("0", 18),
-		strings.Repeat("0", 20),
-		strings.Repeat("0", 18) + "u",
-		strings.Repeat("0", 18) + "U",
-		strings.Repeat("0", 18) + "!",
-		strings.Repeat("0", 18) + string([]byte{0xff}),
-		"",
+	for _, value := range []any{1, []byte{}, make([]byte, 13)} {
+		var scanned Muid
+		if err := scanned.Scan(value); !errors.Is(err, ErrInvalid) {
+			t.Errorf("Scan(%T) error = %v, want ErrInvalid", value, err)
+		}
 	}
-	for _, input := range invalidInputs {
-		_, err := Parse(input)
-		if !errors.Is(err, ErrInvalid) {
-			t.Errorf("Parse(%q) error = %v, want error wrapping ErrInvalid", input, err)
-			continue
-		}
-		if strings.Contains(err.Error(), "\n") {
-			t.Errorf("Parse(%q) error contains a newline: %q", input, err)
-		}
+	var scanned Muid
+	if err := scanned.Scan(badCRC[:]); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("Scan(bad checksum) error = %v, want checksum ErrInvalid", err)
 	}
 }
 
 func TestOrdering(t *testing.T) {
+	equal := newMuid(123, 456)
+	if got := equal.Compare(equal); got != 0 {
+		t.Fatalf("Compare(equal) = %d, want 0", got)
+	}
+
 	rng := rand.New(rand.NewSource(2))
 	for range 1000 {
-		ns1, ns2 := rng.Int63(), rng.Int63()
-		m1 := testMuid(ns1, rng.Uint32())
-		m2 := testMuid(ns2, rng.Uint32())
+		ts1, ts2 := rng.Int63(), rng.Int63()
+		if ts1 == ts2 {
+			ts2++
+		}
+		m1 := referenceMuid(ts1, uint16(rng.Uint32()))
+		m2 := referenceMuid(ts2, uint16(rng.Uint32()))
 
 		if got, want := sign(m1.Compare(m2)), sign(strings.Compare(m1.String(), m2.String())); got != want {
 			t.Fatalf("binary ordering = %d, text ordering = %d for %x and %x", got, want, m1, m2)
 		}
-		if ns1 != ns2 {
-			if got, want := sign(m1.Compare(m2)), sign(compareInt64(ns1, ns2)); got != want {
-				t.Fatalf("identifier ordering = %d, timestamp ordering = %d for %d and %d", got, want, ns1, ns2)
-			}
+		if got, want := sign(m1.Compare(m2)), sign(compareInt64(ts1, ts2)); got != want {
+			t.Fatalf("identifier ordering = %d, timestamp ordering = %d for %d and %d", got, want, ts1, ts2)
 		}
 	}
 }
@@ -233,26 +376,29 @@ func TestGeneratorMonotonicity(t *testing.T) {
 	previous := g.next(42)
 	for range 100 {
 		next := g.next(42)
-		if next.Compare(previous) <= 0 {
-			t.Fatalf("same-time next() = %x, previous = %x", next, previous)
+		if next.Compare(previous) <= 0 || strings.Compare(next.String(), previous.String()) <= 0 {
+			t.Fatalf("same-time next() = %x / %q, previous = %x / %q", next, next.String(), previous, previous.String())
 		}
 		previous = next
 	}
 
 	backward := g.next(1)
-	if backward.Compare(previous) <= 0 {
-		t.Fatalf("backward-time next() = %x, previous = %x", backward, previous)
+	if backward.Compare(previous) <= 0 || strings.Compare(backward.String(), previous.String()) <= 0 {
+		t.Fatalf("backward-time next() = %x / %q, previous = %x / %q", backward, backward.String(), previous, previous.String())
 	}
 
 	last := int64(123)
-	g = generator{last: last, tail: math.MaxUint32}
-	before := testMuid(last, math.MaxUint32)
+	g = generator{last: last, rnd: math.MaxUint16}
+	before := newMuid(last, math.MaxUint16)
 	overflow := g.next(last)
 	if got := int64(binary.BigEndian.Uint64(overflow[:8])); got != last+1 {
 		t.Fatalf("overflow timestamp = %d, want %d", got, last+1)
 	}
-	if overflow.Compare(before) <= 0 {
-		t.Fatalf("overflow next() = %x, previous = %x", overflow, before)
+	if g.last != last+1 {
+		t.Fatalf("generator last = %d, want %d", g.last, last+1)
+	}
+	if overflow.Compare(before) <= 0 || strings.Compare(overflow.String(), before.String()) <= 0 {
+		t.Fatalf("overflow next() = %x / %q, previous = %x / %q", overflow, overflow.String(), before, before.String())
 	}
 }
 
@@ -285,109 +431,20 @@ func TestNewConcurrency(t *testing.T) {
 	}
 }
 
-func TestJSONRoundTrip(t *testing.T) {
-	want := testMuid(1_726_000_000_123_456_789, 0x87654321)
-	data, err := json.Marshal(want)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-
-	var got Muid
-	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v", err)
-	}
-	if got != want {
-		t.Fatalf("JSON round trip = %x, want %x", got, want)
-	}
-}
-
-func TestValueAndScan(t *testing.T) {
-	want := testMuid(1_726_000_000_123_456_789, 0x87654321)
-	value, err := want.Value()
-	if err != nil {
-		t.Fatalf("Value() error = %v", err)
-	}
-	text, ok := value.(string)
-	if !ok {
-		t.Fatalf("Value() type = %T, want string", value)
-	}
-
-	var fromValue Muid
-	if err := fromValue.Scan(text); err != nil {
-		t.Fatalf("Scan(string) error = %v", err)
-	}
-	if fromValue != want {
-		t.Fatalf("Scan(string) = %x, want %x", fromValue, want)
-	}
-
-	binaryData, err := want.MarshalBinary()
-	if err != nil {
-		t.Fatalf("MarshalBinary() error = %v", err)
-	}
-	var fromBinary Muid
-	if err := fromBinary.Scan(binaryData); err != nil {
-		t.Fatalf("Scan([]byte binary) error = %v", err)
-	}
-	if fromBinary != want {
-		t.Fatalf("Scan([]byte binary) = %x, want %x", fromBinary, want)
-	}
-
-	var fromText Muid
-	if err := fromText.Scan([]byte(want.String())); err != nil {
-		t.Fatalf("Scan([]byte text) error = %v", err)
-	}
-	if fromText != want {
-		t.Fatalf("Scan([]byte text) = %x, want %x", fromText, want)
-	}
-
-	var invalidScan Muid
-	if err := invalidScan.Scan(1); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("Scan(int) error = %v, want error wrapping ErrInvalid", err)
-	}
-
-	for _, length := range []int{0, 10, 20} {
-		var scanned Muid
-		if err := scanned.Scan(make([]byte, length)); !errors.Is(err, ErrInvalid) {
-			t.Errorf("Scan([]byte of length %d) error = %v, want error wrapping ErrInvalid", length, err)
-		}
-	}
-
-	topBitSet := make([]byte, 12)
-	topBitSet[0] = 0x80
-	var scanned Muid
-	if err := scanned.Scan(topBitSet); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("Scan(top-bit-set binary) error = %v, want error wrapping ErrInvalid", err)
-	}
-}
-
 func FuzzParse(f *testing.F) {
-	for _, seed := range []string{
-		"0000000000000000000",
-		"zzzzzzzzzzzzzzzzzzz",
-		"000000000000000000I",
-		"",
-		"000000000000000000u",
-		"not-a-valid-muid",
-	} {
-		f.Add(seed)
-	}
+	f.Add(newMuid(1_726_000_000_123_456_789, 0x1234).String())
+	f.Add(strings.Repeat("0", textLength))
+	f.Add(strings.Repeat("z", textLength))
+	f.Add("not-a-valid-muid")
+	f.Add("")
 
 	f.Fuzz(func(t *testing.T, input string) {
 		m, err := Parse(input)
 		if err != nil {
 			return
 		}
-
-		canonical := m.String()
-		if len(canonical) != 19 {
-			t.Fatalf("String() length = %d, want 19", len(canonical))
-		}
-		parsed, err := Parse(canonical)
-		if err != nil {
-			t.Fatalf("Parse(String()) error = %v", err)
-		}
-		if parsed != m {
-			t.Fatalf("Parse(String()) = %x, want %x", parsed, m)
+		if got := m.String(); got != input {
+			t.Fatalf("String() = %q, want accepted input %q", got, input)
 		}
 	})
 }
@@ -402,14 +459,18 @@ func BenchmarkNew(b *testing.B) {
 func BenchmarkNewParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
+		var result Muid
 		for pb.Next() {
-			New()
+			result = New()
 		}
+		benchmarkMu.Lock()
+		benchmarkMuid = result
+		benchmarkMu.Unlock()
 	})
 }
 
 func BenchmarkString(b *testing.B) {
-	m := testMuid(1_726_000_000_123_456_789, 0x12345678)
+	m := newMuid(1_726_000_000_123_456_789, 0x1234)
 	b.ReportAllocs()
 	for range b.N {
 		benchmarkString = m.String()
@@ -417,7 +478,7 @@ func BenchmarkString(b *testing.B) {
 }
 
 func BenchmarkParse(b *testing.B) {
-	text := testMuid(1_726_000_000_123_456_789, 0x12345678).String()
+	text := newMuid(1_726_000_000_123_456_789, 0x1234).String()
 	b.ReportAllocs()
 	for range b.N {
 		var err error
@@ -428,27 +489,71 @@ func BenchmarkParse(b *testing.B) {
 	}
 }
 
-func testMuid(ns int64, tail uint32) Muid {
+func referenceMuid(ns int64, rnd uint16) Muid {
 	var m Muid
 	binary.BigEndian.PutUint64(m[:8], uint64(ns))
-	binary.BigEndian.PutUint32(m[8:], tail)
+	binary.BigEndian.PutUint16(m[8:10], rnd)
+	binary.BigEndian.PutUint16(m[10:12], referenceCRC16(m[:10]))
 	return m
 }
 
+func referenceCRC16(data []byte) uint16 {
+	crc := uint16(0xffff)
+	for _, b := range data {
+		crc ^= uint16(b) << 8
+		for range 8 {
+			if crc&0x8000 != 0 {
+				crc = crc<<1 ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+}
+
 func referenceString(m Muid) string {
-	const referenceAlphabet = "0123456789abcdefghjkmnpqrstvwxyz"
+	const referenceAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 	value := new(big.Int).SetBytes(m[:])
-	base := big.NewInt(32)
+	base := big.NewInt(62)
 	quotient := new(big.Int)
 	remainder := new(big.Int)
-	var text [19]byte
+	var text [textLength]byte
 	for i := len(text) - 1; i >= 0; i-- {
 		quotient.QuoRem(value, base, remainder)
 		text[i] = referenceAlphabet[remainder.Int64()]
 		value.Set(quotient)
 	}
 	return string(text[:])
+}
+
+func assertInvalid(t *testing.T, input, name string) {
+	t.Helper()
+	if _, err := Parse(input); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Parse(%s) error = %v, want ErrInvalid", name, err)
+	}
+}
+
+func assertChecksumMismatch(t *testing.T, input string) {
+	t.Helper()
+	_, err := Parse(input)
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("Parse(%q) error = %v, want checksum ErrInvalid", input, err)
+	}
+}
+
+func flipLetterCase(input string) (string, bool) {
+	for i := range input {
+		c := input[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+			return input[:i] + string(c-'A'+'a') + input[i+1:], true
+		case c >= 'a' && c <= 'z':
+			return input[:i] + string(c-'a'+'A') + input[i+1:], true
+		}
+	}
+	return input, false
 }
 
 func sign(value int) int {
