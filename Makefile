@@ -9,8 +9,9 @@ all: lint test build ## run lint, tests, and build
 build: ## build all packages
 	go build ./...
 
-install: ## install the muid binary
-	go install ./cmd/muid
+install: ## install the muid binary into ~/.local/bin
+	@mkdir -p $(HOME)/.local/bin
+	GOBIN=$(HOME)/.local/bin go install ./cmd/muid
 
 test: ## run the race-enabled test suite
 	go test -race ./...
