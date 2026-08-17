@@ -20,8 +20,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("muid", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
-	n := flags.Int("n", 1, "number of IDs to generate")
-	d := flags.String("d", "", "decode an ID")
+	n := flags.Int("n", 1, "number of µIDs to generate")
+	d := flags.String("d", "", "decode a µID")
 
 	if err := flags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
