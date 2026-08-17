@@ -1,4 +1,23 @@
-// Package muid implements a 96-bit monotonic, sortable opaque identifier: uniqueness is strict per process and cross-process collisions have about a 2^-32 chance for a pair generated in the same nanosecond. Its binary and text forms sort in generation order. It is not a security token: tails within one nanosecond are sequential rather than uniformly random, so muid must not be used as an unguessable secret. Nanoseconds are the storage unit, not a guaranteed clock resolution; wall-clock corrections can affect cross-process ordering. The 12-byte big-endian format consists of an int64 Unix-nanoseconds timestamp whose top bit is always zero, followed by a uint32 tail; its text form is exactly 19 characters of lowercase Crockford base32. The timestamp range extends through roughly the year 2262, matching time.Time.UnixNano; beyond that, the top-bit-zero invariant and monotonic ordering assumptions no longer hold.
+// Package muid implements a 96-bit monotonic, sortable opaque identifier.
+// Its 12-byte binary form is a 63-bit-effective, big-endian int64 Unix-nanoseconds
+// timestamp, followed by a 16-bit random field and a 16-bit CRC-16/CCITT-FALSE
+// checksum over the first 10 bytes. Its text form is exactly 16 case-sensitive
+// base62 characters, fixed-width and left-padded with '0'. Text lexicographic
+// order, numeric order, and binary byte order all equal creation order.
+//
+// Muid is strictly monotonic within one process, including across backward clock
+// jumps. Two independently generated ids in the same nanosecond have roughly a
+// 2^-16 collision probability. The checksum detects accidental corruption of
+// parsed text with probability 1 - 2^-16, but provides no uniqueness benefit.
+// Muid is not a security token: values within one nanosecond are sequential after
+// the first random field rather than independently random. Nanoseconds are the
+// storage unit, not a guaranteed clock resolution. The top-bit-zero timestamp
+// invariant is valid through roughly the year 2262, matching time.Time.UnixNano.
+//
+// The zero Muid encodes as sixteen '0' characters, but it is not CRC-valid, so
+// Parse of that text returns a checksum error. String round trips are guaranteed
+// only for ids produced by New or accepted by Parse, UnmarshalBinary, or Scan;
+// arbitrary byte patterns, including the zero value, are not necessarily valid.
 package muid
 
 import (
@@ -6,14 +25,16 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 	"math/rand/v2"
 	"sync"
 	"time"
 )
 
 const (
-	alphabet     = "0123456789abcdefghjkmnpqrstvwxyz"
+	alphabet     = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 	invalidDigit = 0xff
+	textLength   = 16
 )
 
 var decodeTable = func() [256]byte {
@@ -22,15 +43,24 @@ var decodeTable = func() [256]byte {
 		table[i] = invalidDigit
 	}
 	for i := range alphabet {
-		c := alphabet[i]
-		table[c] = byte(i)
-		if c >= 'a' && c <= 'z' {
-			table[c-'a'+'A'] = byte(i)
-		}
+		table[alphabet[i]] = byte(i)
 	}
-	table['i'], table['I'] = 1, 1
-	table['l'], table['L'] = 1, 1
-	table['o'], table['O'] = 0, 0
+	return table
+}()
+
+var crcTable = func() [256]uint16 {
+	var table [256]uint16
+	for i := range table {
+		crc := uint16(i) << 8
+		for range 8 {
+			if crc&0x8000 != 0 {
+				crc = crc<<1 ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+		table[i] = crc
+	}
 	return table
 }()
 
@@ -43,7 +73,7 @@ type Muid [12]byte
 type generator struct {
 	mu   sync.Mutex
 	last int64
-	tail uint32
+	rnd  uint16
 }
 
 var globalGen generator
@@ -64,53 +94,75 @@ func (g *generator) next(now int64) Muid {
 
 	if now > g.last {
 		g.last = now
-		g.tail = rand.Uint32()
+		g.rnd = uint16(rand.Uint32())
 	} else {
-		g.tail++
-		if g.tail == 0 {
+		g.rnd++
+		if g.rnd == 0 {
 			g.last++
-			g.tail = rand.Uint32()
+			g.rnd = uint16(rand.Uint32())
 		}
 	}
 
-	return muidFromParts(g.last, g.tail)
+	return newMuid(g.last, g.rnd)
 }
 
-func muidFromParts(ns int64, tail uint32) Muid {
+func newMuid(ns int64, rnd uint16) Muid {
 	var m Muid
 	binary.BigEndian.PutUint64(m[:8], uint64(ns))
-	binary.BigEndian.PutUint32(m[8:], tail)
+	binary.BigEndian.PutUint16(m[8:10], rnd)
+	binary.BigEndian.PutUint16(m[10:12], crc16(m[:10]))
 	return m
 }
 
-// Parse parses a 19-character muid text value. It accepts uppercase letters and
-// maps i and l to 1 and o to 0; therefore Parse(s).String() may differ from s.
+func crc16(data []byte) uint16 {
+	crc := uint16(0xffff)
+	for _, b := range data {
+		crc = crc<<8 ^ crcTable[byte(crc>>8)^b]
+	}
+	return crc
+}
+
+// Parse parses a 16-character, case-sensitive base62 muid text value.
 func Parse(s string) (Muid, error) {
-	if len(s) != 19 {
+	if len(s) != textLength {
 		return Muid{}, invalid("invalid muid text length")
 	}
 
-	var m Muid
-	for i := 0; i < len(s); i++ {
-		digit, ok := decodeDigit(s[i])
-		if !ok {
+	var hi, lo uint64
+	for i := range s {
+		digit := decodeTable[s[i]]
+		if digit == invalidDigit {
 			return Muid{}, invalid("invalid muid text character")
 		}
 
-		for j := 0; j < 5; j++ {
-			if digit&(1<<uint(4-j)) == 0 {
-				continue
-			}
-
-			bit := 94 - i*5 - j
-			m[11-bit/8] |= 1 << uint(bit%8)
+		loHi, newLo := bits.Mul64(lo, 62)
+		hiHi, hiLo := bits.Mul64(hi, 62)
+		newHi, carry := bits.Add64(loHi, hiLo, 0)
+		if hiHi != 0 || carry != 0 {
+			return Muid{}, invalid("value out of range")
 		}
+		newLo, carry = bits.Add64(newLo, uint64(digit), 0)
+		newHi, carry = bits.Add64(newHi, 0, carry)
+		if carry != 0 {
+			return Muid{}, invalid("value out of range")
+		}
+		hi, lo = newHi, newLo
 	}
 
-	return m, nil
+	if hi >= 1<<31 {
+		return Muid{}, invalid("value out of range")
+	}
+
+	var parsed Muid
+	binary.BigEndian.PutUint32(parsed[:4], uint32(hi))
+	binary.BigEndian.PutUint64(parsed[4:], lo)
+	if crc16(parsed[:10]) != binary.BigEndian.Uint16(parsed[10:12]) {
+		return Muid{}, invalid("checksum mismatch")
+	}
+	return parsed, nil
 }
 
-// MustParse parses a 19-character muid text value and panics if it is invalid.
+// MustParse parses a 16-character muid text value and panics if it is invalid.
 func MustParse(s string) Muid {
 	m, err := Parse(s)
 	if err != nil {
@@ -119,29 +171,29 @@ func MustParse(s string) Muid {
 	return m
 }
 
-// String returns the canonical 19-character Crockford Base32 form.
+// String returns the canonical 16-character base62 form.
 func (m Muid) String() string {
-	var text [19]byte
+	var text [textLength]byte
 	m.encode(&text)
 	return string(text[:])
 }
 
 // AppendText appends the canonical text form to dst.
 func (m Muid) AppendText(dst []byte) ([]byte, error) {
-	var text [19]byte
+	var text [textLength]byte
 	m.encode(&text)
 	return append(dst, text[:]...), nil
 }
 
-func (m Muid) encode(text *[19]byte) {
-	for i := range text {
-		bit := 94 - i*5
-		var digit byte
-		for j := 0; j < 5; j++ {
-			position := bit - j
-			digit = digit<<1 | (m[11-position/8]>>uint(position%8))&1
-		}
+func (m Muid) encode(text *[textLength]byte) {
+	hi := binary.BigEndian.Uint32(m[:4])
+	lo := binary.BigEndian.Uint64(m[4:])
+	for i := len(text) - 1; i >= 0; i-- {
+		qHi := hi / 62
+		remainder := hi % 62
+		qLo, digit := bits.Div64(uint64(remainder), lo, 62)
 		text[i] = alphabet[digit]
+		hi, lo = qHi, qLo
 	}
 }
 
@@ -170,7 +222,7 @@ func (m Muid) Compare(other Muid) int {
 
 // MarshalText returns the canonical text form.
 func (m Muid) MarshalText() ([]byte, error) {
-	var text [19]byte
+	var text [textLength]byte
 	m.encode(&text)
 	return append([]byte(nil), text[:]...), nil
 }
@@ -199,17 +251,29 @@ func (m *Muid) UnmarshalBinary(data []byte) error {
 	if m == nil {
 		return invalid("nil muid receiver")
 	}
+
+	parsed, err := parseBinary(data)
+	if err != nil {
+		return err
+	}
+	*m = parsed
+	return nil
+}
+
+func parseBinary(data []byte) (Muid, error) {
 	if len(data) != len(Muid{}) {
-		return invalid("invalid muid binary length")
+		return Muid{}, invalid("invalid muid binary length")
 	}
 	if data[0]&0x80 != 0 {
-		return invalid("invalid muid binary timestamp")
+		return Muid{}, invalid("invalid muid binary timestamp")
+	}
+	if crc16(data[:10]) != binary.BigEndian.Uint16(data[10:12]) {
+		return Muid{}, invalid("checksum mismatch")
 	}
 
 	var parsed Muid
 	copy(parsed[:], data)
-	*m = parsed
-	return nil
+	return parsed, nil
 }
 
 // Value returns the canonical text form for database storage.
@@ -232,33 +296,23 @@ func (m *Muid) Scan(src any) error {
 		*m = parsed
 		return nil
 	case []byte:
-		switch len(value) {
-		case 19:
+		if len(value) == textLength {
 			parsed, err := Parse(string(value))
 			if err != nil {
 				return err
 			}
 			*m = parsed
 			return nil
-		case 12:
-			if value[0]&0x80 != 0 {
-				return invalid("invalid muid binary timestamp")
-			}
-			var parsed Muid
-			copy(parsed[:], value)
-			*m = parsed
-			return nil
-		default:
-			return invalid("invalid muid scan byte length")
 		}
+		parsed, err := parseBinary(value)
+		if err != nil {
+			return err
+		}
+		*m = parsed
+		return nil
 	default:
 		return invalid("invalid muid scan type")
 	}
-}
-
-func decodeDigit(c byte) (byte, bool) {
-	digit := decodeTable[c]
-	return digit, digit != invalidDigit
 }
 
 func invalid(message string) error {
