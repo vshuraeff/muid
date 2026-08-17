@@ -174,7 +174,9 @@ Two consequences are worth stating plainly:
 
 ## Format
 
-The normative format specification lives in [SPEC.md](SPEC.md).
+The normative format specification lives in [SPEC.md](SPEC.md). A pure-SQL PostgreSQL
+implementation, needing no extension, lives in [postgres/muid.sql](postgres/muid.sql) and is
+documented in [POSTGRES.md](POSTGRES.md).
 
 | Property        | Value                                                               |
 | --------------- | ------------------------------------------------------------------- |
