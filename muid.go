@@ -1,9 +1,11 @@
 // Package muid implements a 96-bit monotonic, sortable opaque identifier.
-// Its 12-byte binary form is a 63-bit-effective, big-endian int64 Unix-nanoseconds
+// Its 12-byte binary form is an unsigned 64-bit, big-endian Unix-nanoseconds
 // timestamp, followed by a 16-bit random field and a 16-bit CRC-16/CCITT-FALSE
-// checksum over the first 10 bytes. Its text form is exactly 16 case-sensitive
-// base62 characters, fixed-width and left-padded with '0'. Text lexicographic
-// order, numeric order, and binary byte order all equal creation order.
+// checksum over the first 10 bytes. A muid is valid when its 96-bit value is
+// less than 62^16 and its checksum matches. Its text form is exactly 16
+// case-sensitive base62 characters, fixed-width and left-padded with '0'. Text
+// lexicographic order, numeric order, and binary byte order all equal creation
+// order.
 //
 // Muid is strictly monotonic within one process, including across backward clock
 // jumps. Two independently generated ids in the same nanosecond have roughly a
@@ -11,8 +13,10 @@
 // parsed text with probability 1 - 2^-16, but provides no uniqueness benefit.
 // Muid is not a security token: values within one nanosecond are sequential after
 // the first random field rather than independently random. Nanoseconds are the
-// storage unit, not a guaranteed clock resolution. The top-bit-zero timestamp
-// invariant is valid through roughly the year 2262, matching time.Time.UnixNano.
+// storage unit, not a guaranteed clock resolution. Timestamps through roughly
+// the year 2321 are representable. This is a strict widening of the previous
+// 2^95-bounded, top-bit-zero rules: every identifier valid under those rules
+// remains valid and encodes identically.
 //
 // The zero Muid encodes as sixteen '0' characters, but it is not CRC-valid, so
 // Parse of that text returns a checksum error. String round trips are guaranteed
@@ -21,6 +25,7 @@
 package muid
 
 import (
+	"bytes"
 	"database/sql/driver"
 	"encoding/binary"
 	"errors"
@@ -36,6 +41,8 @@ const (
 	invalidDigit = 0xff
 	textLength   = 16
 )
+
+var maxValidPlusOne = [12]byte{0x9a, 0x09, 0xaf, 0xba, 0xe8, 0x30, 0x50, 0xa9, 0xde, 0x01, 0x00, 0x00}
 
 var decodeTable = func() [256]byte {
 	var table [256]byte
@@ -72,15 +79,22 @@ type Muid [12]byte
 
 type generator struct {
 	mu   sync.Mutex
-	last int64
+	last uint64
 	rnd  uint16
 }
 
 var globalGen generator
 
+func clampNanos(ns int64) uint64 {
+	if ns < 0 {
+		return 0
+	}
+	return uint64(ns)
+}
+
 // New returns a new strictly monotonic identifier for this process.
 func New() Muid {
-	return globalGen.next(time.Now().UnixNano())
+	return globalGen.next(clampNanos(time.Now().UnixNano()))
 }
 
 // NewString returns the canonical text form of a new identifier.
@@ -88,7 +102,7 @@ func NewString() string {
 	return New().String()
 }
 
-func (g *generator) next(now int64) Muid {
+func (g *generator) next(now uint64) Muid {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -106,9 +120,9 @@ func (g *generator) next(now int64) Muid {
 	return newMuid(g.last, g.rnd)
 }
 
-func newMuid(ns int64, rnd uint16) Muid {
+func newMuid(ns uint64, rnd uint16) Muid {
 	var m Muid
-	binary.BigEndian.PutUint64(m[:8], uint64(ns))
+	binary.BigEndian.PutUint64(m[:8], ns)
 	binary.BigEndian.PutUint16(m[8:10], rnd)
 	binary.BigEndian.PutUint16(m[10:12], crc16(m[:10]))
 	return m
@@ -136,21 +150,11 @@ func Parse(s string) (Muid, error) {
 		}
 
 		loHi, newLo := bits.Mul64(lo, 62)
-		hiHi, hiLo := bits.Mul64(hi, 62)
-		newHi, carry := bits.Add64(loHi, hiLo, 0)
-		if hiHi != 0 || carry != 0 {
-			return Muid{}, invalid("value out of range")
-		}
-		newLo, carry = bits.Add64(newLo, uint64(digit), 0)
-		newHi, carry = bits.Add64(newHi, 0, carry)
-		if carry != 0 {
-			return Muid{}, invalid("value out of range")
-		}
+		_, hiLo := bits.Mul64(hi, 62)
+		newHi, _ := bits.Add64(loHi, hiLo, 0)
+		newLo, carry := bits.Add64(newLo, uint64(digit), 0)
+		newHi, _ = bits.Add64(newHi, 0, carry)
 		hi, lo = newHi, newLo
-	}
-
-	if hi >= 1<<31 {
-		return Muid{}, invalid("value out of range")
 	}
 
 	var parsed Muid
@@ -198,8 +202,13 @@ func (m Muid) encode(text *[textLength]byte) {
 }
 
 // Time returns the time encoded in m.
+// Calling UnixNano on the result is undefined for timestamps outside its
+// representable range, roughly the years 1678 through 2262. Callers that need
+// the raw 64-bit nanosecond value outside that range should decode the first
+// eight bytes of MarshalBinary's result, or m[:8], as a big-endian uint64.
 func (m Muid) Time() time.Time {
-	return time.Unix(0, int64(binary.BigEndian.Uint64(m[:8])))
+	ns := binary.BigEndian.Uint64(m[:8])
+	return time.Unix(int64(ns/1_000_000_000), int64(ns%1_000_000_000))
 }
 
 // IsZero reports whether m is the zero identifier.
@@ -264,8 +273,8 @@ func parseBinary(data []byte) (Muid, error) {
 	if len(data) != len(Muid{}) {
 		return Muid{}, invalid("invalid muid binary length")
 	}
-	if data[0]&0x80 != 0 {
-		return Muid{}, invalid("invalid muid binary timestamp")
+	if bytes.Compare(data, maxValidPlusOne[:]) >= 0 {
+		return Muid{}, invalid("invalid muid binary value")
 	}
 	if crc16(data[:10]) != binary.BigEndian.Uint16(data[10:12]) {
 		return Muid{}, invalid("checksum mismatch")
