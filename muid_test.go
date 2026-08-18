@@ -518,6 +518,69 @@ func TestGeneratorMonotonicity(t *testing.T) {
 	}
 }
 
+func TestNodeGeneratorMonotonicity(t *testing.T) {
+	g := NewNodeGenerator(0x1234)
+	previous := g.next(42)
+	for range 100 {
+		next := g.next(42)
+		if next.Compare(previous) <= 0 || strings.Compare(next.String(), previous.String()) <= 0 {
+			t.Fatalf("same-time next() = %x / %q, previous = %x / %q", next, next.String(), previous, previous.String())
+		}
+		previous = next
+	}
+}
+
+func TestNodeGeneratorBackwardClockJump(t *testing.T) {
+	g := NewNodeGenerator(0x1234)
+	previous := g.next(100)
+	backward := g.next(1)
+	if backward.Compare(previous) <= 0 || strings.Compare(backward.String(), previous.String()) <= 0 {
+		t.Fatalf("backward-time next() = %x / %q, previous = %x / %q", backward, backward.String(), previous, previous.String())
+	}
+}
+
+func TestNodeGeneratorDiscriminator(t *testing.T) {
+	for _, node := range []uint16{0, 1, 0x1234, math.MaxUint16} {
+		g := NewNodeGenerator(node)
+		ids := []Muid{g.next(42), g.next(42), g.next(100), g.next(1), g.New()}
+		for _, m := range ids {
+			if got := binary.BigEndian.Uint16(m[8:10]); got != node {
+				t.Fatalf("node discriminator = %04x, want %04x", got, node)
+			}
+		}
+	}
+}
+
+func TestNodeGeneratorCRC(t *testing.T) {
+	m := NewNodeGenerator(0x1234).next(42)
+	if got, want := binary.BigEndian.Uint16(m[10:12]), referenceCRC16(m[:10]); got != want {
+		t.Fatalf("stored CRC = %04x, reference CRC = %04x", got, want)
+	}
+}
+
+func TestNodeGeneratorsDoNotCollide(t *testing.T) {
+	const now uint64 = 42
+	first := NewNodeGenerator(1).next(now)
+	second := NewNodeGenerator(2).next(now)
+	if first == second {
+		t.Fatalf("different-node ids collide: %x", first)
+	}
+}
+
+func TestNodeGeneratorNewString(t *testing.T) {
+	text := NewNodeGenerator(0x1234).NewString()
+	if len(text) != textLength {
+		t.Fatalf("NewString() length = %d, want %d", len(text), textLength)
+	}
+	parsed, err := Parse(text)
+	if err != nil {
+		t.Fatalf("Parse(NewString()) error = %v", err)
+	}
+	if parsed.String() != text {
+		t.Fatalf("Parse(NewString()).String() = %q, want %q", parsed.String(), text)
+	}
+}
+
 func TestGeneratorClampedNegativeTimeRecovery(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -621,6 +684,14 @@ func BenchmarkNew(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		benchmarkMuid = New()
+	}
+}
+
+func BenchmarkNodeGeneratorNew(b *testing.B) {
+	g := NewNodeGenerator(1)
+	b.ReportAllocs()
+	for range b.N {
+		benchmarkMuid = g.New()
 	}
 }
 
