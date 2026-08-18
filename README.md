@@ -333,15 +333,16 @@ not contain. Measured timings, for µID only, follow it.
 | Text length                      | 16             | 36               | 36                  | 26               | 20                      | 27                  |
 | Timestamp precision              | nanoseconds    | none             | milliseconds        | milliseconds     | seconds                 | seconds             |
 | Text sorts by time               | yes            | no               | yes                 | yes              | yes                     | yes                 |
-| In-process monotonic[^monotonic] | per generator  | no               | optional (RFC 9562) | optional (spec)  | counter within a second | optional (Sequence) |
+| In-process monotonic[^monotonic] | yes            | no               | optional (RFC 9562) | optional (spec)  | yes                     | optional (Sequence) |
 | Checksum                         | CRC-16         | none             | none                | none             | none                    | none                |
-| Host/process field               | none           | none             | none                | none             | machine id + pid        | none                |
+| Host/process field[^nodeid]      | none           | none             | none                | none             | machine id + pid        | none                |
 | Case handling                    | case-sensitive | case-insensitive | case-insensitive    | case-insensitive | case-sensitive          | case-sensitive      |
 | Upper time bound                 | 2321           | n/a              | 10889               | 10889            | 2106                    | 2150                |
 
 Where the six do not differ: all are fixed-width, and all encode to characters that need no
 escaping in a URL, a filename, or a shell word. None of them needs a central allocator or a
-registry.
+registry; µID's opt-in node profile needs unique node ids from the operator, which is static
+configuration rather than a service.
 
 <details>
 <summary>Reading the differences</summary>
@@ -396,9 +397,16 @@ spare capacity.[^others]
 </details>
 
 [^monotonic]: The monotonic row counts what each format's specification or reference
-    implementation offers. µID's is not optional, but it is scoped to one generator: the
-    package-level `New` is a single generator per process, and generators from
-    `NewNodeGenerator` are coordinated neither with it nor with each other.
+    implementation offers. Every entry in it is scoped to one generator by default. µID's is
+    not optional, and the guarantee belongs to the package-level `New`, a single generator per
+    process; generators from `NewNodeGenerator` are coordinated neither with it nor with each
+    other. The optional modes carry the same limitation — UUIDv7's RFC 9562 counters, ULID's
+    monotonic factory and ksuid's `Sequence` each order only the ids that pass through the one
+    counter they hold, though RFC 9562 §6.3 does let a UUIDv7 deployment keep that counter
+    state in a store shared across the system.
+
+[^nodeid]: The row states the default. `NewNodeGenerator` is the opt-in exception: the
+    generators it returns embed an operator-assigned node id in bytes 8..9.
 
 [^bench]: Measured on an Intel Core i9-9900K, Go 1.26, `darwin/amd64`, via
     `go test -bench=Benchmark -benchmem -run=NoTests -count=3 .`
