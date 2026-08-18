@@ -11,6 +11,9 @@
 // jumps. Two independently generated ids in the same nanosecond have roughly a
 // 2^-16 collision probability. The checksum detects accidental corruption of
 // parsed text with probability 1 - 2^-16, but provides no uniqueness benefit.
+// NewNodeGenerator provides an opt-in alternative with a caller-assigned,
+// stable 16-bit node discriminator that prevents collisions across distinct
+// node ids.
 // µID is not a security token: values within one nanosecond are sequential after
 // the first random field rather than independently random. Nanoseconds are the
 // storage unit, not a guaranteed clock resolution. Timestamps through roughly
@@ -103,6 +106,16 @@ type generator struct {
 	rnd  uint16
 }
 
+// Generator is a µID generator with an operator-assigned, stable node id in
+// place of the random discriminator. Distinct node ids guarantee zero
+// cross-node collisions, unlike the roughly 2^-16 collision probability for
+// independently generated ids in the same nanosecond from the global generator.
+type Generator struct {
+	mu   sync.Mutex
+	last uint64
+	node uint16
+}
+
 var globalGen generator
 
 func clampNanos(ns int64) uint64 {
@@ -122,6 +135,30 @@ func NewString() string {
 	return New().String()
 }
 
+// NewNodeGenerator returns a Generator that stamps node into bytes 8-9 of every
+// id. The node id must be exclusive across the entire fleet while a generator
+// is live: two live generators with the same node id produce deterministic
+// duplicates for any nanosecond where both emit. After a restart that reuses a
+// node id, uniqueness also requires that the process clock never move backward
+// below the last timestamp previously emitted for that node. Do not derive node
+// by hashing a hostname or PID; hashing a small, often-repeating input space
+// does not reduce the expected number of collisions or provide the intended
+// zero-collision guarantee.
+func NewNodeGenerator(node uint16) *Generator {
+	return &Generator{node: node}
+}
+
+// New returns a new strictly monotonic identifier with g's fixed node id.
+func (g *Generator) New() Muid {
+	return g.next(clampNanos(time.Now().UnixNano()))
+}
+
+// NewString returns the canonical text form of a new identifier with g's fixed
+// node id.
+func (g *Generator) NewString() string {
+	return g.New().String()
+}
+
 func (g *generator) next(now uint64) Muid {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -138,6 +175,19 @@ func (g *generator) next(now uint64) Muid {
 	}
 
 	return newMuid(g.last, g.rnd)
+}
+
+func (g *Generator) next(now uint64) Muid {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if now > g.last {
+		g.last = now
+	} else {
+		g.last++
+	}
+
+	return newMuid(g.last, g.node)
 }
 
 func newMuid(ns uint64, rnd uint16) Muid {
