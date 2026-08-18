@@ -16,6 +16,8 @@ install: ## install the muid binary into ~/.local/bin
 test: ## run the race-enabled test suite
 	go test -race ./...
 
+# a real failure writes a minimized seed under testdata/fuzz/, so "context deadline exceeded"
+# with no new file there is the go 1.26.6 fuzz coordinator flaking, not a crasher: rerun it
 fuzz: ## run the parse fuzz target
 	go test -run=NONE -fuzz=FuzzParse -fuzztime=10s .
 

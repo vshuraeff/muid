@@ -1,13 +1,11 @@
 # µID
 
-Compact, time-ordered, self-validating unique identifiers for Go. A µID is 12 bytes wide,
-prints as exactly 16 case-sensitive base62 characters, and sorts in creation order in both
-its binary and its text form — so you can use it as a primary key and still get
-chronological ordering from a plain index scan.
+12 bytes — nanosecond timestamp, random field, CRC-16 — as 16 sortable base62 characters.
 
-The name is written with the micro sign µ (U+00B5), not the Greek letter μ (U+03BC). Every
-code artifact stays ASCII: the module path `github.com/vshuraeff/muid`, the package `muid`,
-and the `muid` binary.
+Compact, time-ordered, self-validating unique identifiers for Go. The text form is
+case-sensitive, and the binary form orders the same way, so a µID works as a primary key that
+still gives chronological ordering from a plain index scan. Every code artifact is ASCII: the
+module path `github.com/vshuraeff/muid`, the package `muid`, and the `muid` binary.
 
 Throughout, "creation order" means creation order within one generating process, where it is
 exact. Ids from different processes sort by their embedded timestamps, so their relative
@@ -20,10 +18,13 @@ nanosecond sort by a random field that carries no temporal meaning.
 9yrSO26QnToYjAL8
 ```
 
-Those 12 bytes are an unsigned 64-bit Unix-nanosecond timestamp, a 16-bit random field, and
-a 16-bit CRC-16/CCITT-FALSE checksum over the other ten bytes. The checksum is what makes a
-µID self-validating: `Parse` rejects a corrupted or mistyped id instead of handing back a
-plausible-looking wrong one.
+Those ids, and every other example in this file, are real ids generated when the file was
+written, so they decode to that date rather than to today's.
+
+The timestamp is an unsigned 64-bit Unix nanosecond count, the random field is 16 bits, and
+the checksum is a 16-bit CRC-16/CCITT-FALSE over the other ten bytes. The checksum is what
+makes a µID self-validating: `Parse` rejects a corrupted or mistyped id instead of handing
+back a plausible-looking wrong one.
 
 Compared with a UUIDv7 it is under half the string length (16 characters against 36),
 timestamps to the nanosecond rather than the millisecond, is strictly monotonic within the
@@ -35,9 +36,6 @@ generating process, and carries an integrity check.
 go get github.com/vshuraeff/muid
 ```
 
-The module path is a placeholder until the package is published; until then, use it from a
-local checkout with a `replace` directive.
-
 ### Development
 
 The `Makefile` drives the standard Go toolchain and needs no external linters. `make all`
@@ -45,6 +43,12 @@ runs lint, tests, and build; `make test` runs the race-enabled suite; `make fuzz
 parse fuzz target; `make bench` runs the benchmarks; `make lint` checks formatting and runs
 `go vet`; `make install` puts the `muid` binary into `~/.local/bin`. `make help` lists every
 target.
+
+Under Go 1.26.6, `make fuzz` intermittently ends with `context deadline exceeded` without
+having found anything: that is the fuzz coordinator missing its own deadline. A real failure
+prints the failing input and writes a minimized seed under `testdata/fuzz/`, so that message
+with no new file there is the flake, and rerunning is the response. Any other failure, or one
+that does leave a seed behind, is a real result.
 
 ## Usage
 
@@ -130,8 +134,12 @@ fails decoding rather than becoming a valid-looking key.
 ### database/sql
 
 `Value` stores the canonical text; `Scan` accepts either the 16-character text (as `string`
-or `[]byte`) or the raw 12 bytes, so the same type works against a `char(16)`, `text`, or
-`bytea`/`blob` column:
+or `[]byte`) or the raw 12 bytes. Reads therefore work against a `char(16)`, `text`, or
+`bytea`/`blob` column alike, but writes only against the text-shaped ones: binding a `Muid`
+straight into a raw byte column stores the 16 ASCII characters of the text form, not the 12
+bytes, and no error is raised. Write the raw form as `id[:]`, or convert in SQL. On
+PostgreSQL, the `muid` domain rejects that mis-sized write instead of storing it — see
+[POSTGRES.md](POSTGRES.md) for the binding rules per driver.
 
 ```go
 _, err := db.Exec("insert into events (id, body) values (?, ?)", muid.New(), "hello")
