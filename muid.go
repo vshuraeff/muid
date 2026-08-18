@@ -29,7 +29,6 @@ import (
 	"database/sql/driver"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"math/bits"
 	"math/rand/v2"
 	"sync"
@@ -74,7 +73,28 @@ var crcTable = func() [256]uint16 {
 // ErrInvalid reports invalid µID text, binary data, or database input.
 var ErrInvalid = errors.New("invalid muid")
 
-// Muid is the 12-byte binary form of a µID, a 96-bit monotonic, sortable opaque identifier.
+type invalidError struct{ message string }
+
+func (e *invalidError) Error() string {
+	return e.message
+}
+
+func (e *invalidError) Unwrap() error {
+	return ErrInvalid
+}
+
+var (
+	errInvalidTextLength  = &invalidError{"invalid muid: invalid muid text length"}
+	errInvalidTextChar    = &invalidError{"invalid muid: invalid muid text character"}
+	errChecksumMismatch   = &invalidError{"invalid muid: checksum mismatch"}
+	errNilReceiver        = &invalidError{"invalid muid: nil muid receiver"}
+	errInvalidBinaryLen   = &invalidError{"invalid muid: invalid muid binary length"}
+	errInvalidBinaryValue = &invalidError{"invalid muid: invalid muid binary value"}
+	errInvalidScanType    = &invalidError{"invalid muid: invalid muid scan type"}
+)
+
+// Muid is the 12-byte binary form of a µID, a 96-bit monotonic, sortable
+// opaque identifier.
 type Muid [12]byte
 
 type generator struct {
@@ -139,14 +159,14 @@ func crc16(data []byte) uint16 {
 // Parse parses a 16-character, case-sensitive base62 µID text value.
 func Parse(s string) (Muid, error) {
 	if len(s) != textLength {
-		return Muid{}, invalid("invalid muid text length")
+		return Muid{}, errInvalidTextLength
 	}
 
 	var hi, lo uint64
 	for i := range s {
 		digit := decodeTable[s[i]]
 		if digit == invalidDigit {
-			return Muid{}, invalid("invalid muid text character")
+			return Muid{}, errInvalidTextChar
 		}
 
 		loHi, newLo := bits.Mul64(lo, 62)
@@ -161,7 +181,7 @@ func Parse(s string) (Muid, error) {
 	binary.BigEndian.PutUint32(parsed[:4], uint32(hi))
 	binary.BigEndian.PutUint64(parsed[4:], lo)
 	if crc16(parsed[:10]) != binary.BigEndian.Uint16(parsed[10:12]) {
-		return Muid{}, invalid("checksum mismatch")
+		return Muid{}, errChecksumMismatch
 	}
 	return parsed, nil
 }
@@ -239,7 +259,7 @@ func (m Muid) MarshalText() ([]byte, error) {
 // UnmarshalText parses text into m.
 func (m *Muid) UnmarshalText(text []byte) error {
 	if m == nil {
-		return invalid("nil muid receiver")
+		return errNilReceiver
 	}
 
 	parsed, err := Parse(string(text))
@@ -258,7 +278,7 @@ func (m Muid) MarshalBinary() ([]byte, error) {
 // UnmarshalBinary decodes the raw 12-byte representation into m.
 func (m *Muid) UnmarshalBinary(data []byte) error {
 	if m == nil {
-		return invalid("nil muid receiver")
+		return errNilReceiver
 	}
 
 	parsed, err := parseBinary(data)
@@ -271,13 +291,13 @@ func (m *Muid) UnmarshalBinary(data []byte) error {
 
 func parseBinary(data []byte) (Muid, error) {
 	if len(data) != len(Muid{}) {
-		return Muid{}, invalid("invalid muid binary length")
+		return Muid{}, errInvalidBinaryLen
 	}
 	if bytes.Compare(data, maxValidPlusOne[:]) >= 0 {
-		return Muid{}, invalid("invalid muid binary value")
+		return Muid{}, errInvalidBinaryValue
 	}
 	if crc16(data[:10]) != binary.BigEndian.Uint16(data[10:12]) {
-		return Muid{}, invalid("checksum mismatch")
+		return Muid{}, errChecksumMismatch
 	}
 
 	var parsed Muid
@@ -293,7 +313,7 @@ func (m Muid) Value() (driver.Value, error) {
 // Scan decodes a text or raw binary database value into m.
 func (m *Muid) Scan(src any) error {
 	if m == nil {
-		return invalid("nil muid receiver")
+		return errNilReceiver
 	}
 
 	switch value := src.(type) {
@@ -320,10 +340,6 @@ func (m *Muid) Scan(src any) error {
 		*m = parsed
 		return nil
 	default:
-		return invalid("invalid muid scan type")
+		return errInvalidScanType
 	}
-}
-
-func invalid(message string) error {
-	return fmt.Errorf("%w: %s", ErrInvalid, message)
 }
