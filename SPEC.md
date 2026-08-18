@@ -3,7 +3,7 @@
 ```
 Document:   µID Format Specification
 Category:   Informational (format specification)
-Revision:   2 (widened value range, see Section 12.1)
+Revision:   3 (optional fixed-discriminator generator profile, see Section 6.6)
 Author:     V. Shuraeff
 Date:       August 2026
 ```
@@ -45,7 +45,7 @@ records.
     2.1.  Field Layout
     2.2.  Bit Diagram
     2.3.  Timestamp Field
-    2.4.  Random Field
+    2.4.  Discriminator Field (Random Field)
     2.5.  Checksum Field
     2.6.  Value Bound
 3.  Checksum Algorithm
@@ -67,6 +67,7 @@ records.
     6.3.  Concurrency
     6.4.  Random Field Source
     6.5.  Resulting Properties
+    6.6.  Fixed-Discriminator Profile (Optional)
 7.  Ordering and Comparison
 8.  Range and Lifetime Limits
 9.  Conformance
@@ -95,12 +96,14 @@ mistyped identifier is rejected rather than accepted as a different valid identi
 - A text form short enough to use in URLs and logs: 16 characters, against 36 for a UUID.
 - Identical ordering in three domains: octet order, integer order, and text lexicographic
   order under a binary collation.
-- Nanosecond time resolution, with strict monotonicity within a generating process even when
-  the wall clock moves backwards.
+- Nanosecond time resolution, with strict monotonicity within one generator even when the wall
+  clock moves backwards.
 - Self-validation: accidental corruption of a transported identifier is detected at parse time
   rather than silently accepted.
-- No configured node identity, and therefore no coordination between generators and no node
-  identity to leak.
+- No configured node identity by default, and therefore no coordination between generators and
+  no node identity to leak. An operator who would rather coordinate than accept probabilistic
+  cross-generator uniqueness can opt into the fixed-discriminator profile of Section 6.6,
+  which trades this goal for exact uniqueness between distinctly numbered nodes.
 
 ### 1.2. Requirements Language
 
@@ -185,12 +188,18 @@ undefined. Implementations should map the field to an instant by splitting it in
 seconds and a nanosecond remainder, and should expose the raw unsigned 64-bit value for callers
 that need it.
 
-### 2.4. Random Field
+### 2.4. Discriminator Field (Random Field)
 
-Octets 8..9 hold a 16-bit value that disambiguates identifiers sharing a timestamp. Decoders
-MUST treat this field as opaque: it carries no structure, no ordering meaning beyond its
-numeric value, and no identity information. Encoders and decoders MUST preserve it verbatim.
-Its production is specified in Section 6.
+Octets 8..9 hold a 16-bit discriminator that separates identifiers sharing a timestamp. Its
+value is chosen by the generator: under the random profile of Section 6.2 it is drawn at
+random and then incremented, and under the fixed-discriminator profile of Section 6.6 it is a
+node identifier the operator assigned. The field is historically named the random field, and
+this document keeps that name in the layout table, the bit diagram, and the test vectors.
+
+Decoders MUST treat the field as opaque. A decoder MUST NOT validate how the value was
+produced, MUST NOT derive an identity from it, MUST NOT read it as evidence that any part of
+the identifier is random, and MUST NOT give its ordering any meaning beyond its numeric value.
+Encoders and decoders MUST preserve it verbatim. Its production is specified in Section 6.
 
 ### 2.5. Checksum Field
 
@@ -384,14 +393,25 @@ This section specifies how a generator produces new identifiers. An implementati
 encodes, decodes, or validates existing identifiers is not required to implement it, but an
 implementation claiming the guarantees of Section 6.5 MUST implement it as specified.
 
+A generator runs exactly one of two profiles. The random profile, defined by Sections 6.2 and
+6.4, is the default and was the only profile before revision 3 of this document. The
+fixed-discriminator profile of Section 6.6 is optional and replaces the drawn field with a
+node identifier the operator assigns. Sections 6.2.1, 6.3, and 6.5 apply to both profiles
+except where they name one, and Section 6.1 defines `last` for both and `rnd` for the random
+profile alone. The two profiles are indistinguishable on the wire, and neither changes what a
+decoder accepts, so Section 12 is unaffected.
+
 ### 6.1. Generator State
 
-A generator holds two variables:
+A generator running the random profile holds two variables:
 
 - `last`: an unsigned 64-bit integer, initially 0, holding the timestamp of the most recently
   emitted identifier.
 - `rnd`: an unsigned 16-bit integer, initially 0, holding the random field of the most recently
   emitted identifier.
+
+A generator running the fixed-discriminator profile of Section 6.6 holds `last` with the same
+definition and no `rnd`, since its octets 8..9 come from configuration rather than from state.
 
 All arithmetic on `last` and `rnd` is unsigned.
 
@@ -464,15 +484,24 @@ whatever produced it.
 
 ### 6.3. Concurrency
 
-All reads and writes of `last` and `rnd`, and the derivation of `t` and `r` from them, MUST be
-serialized so that concurrent calls observe a strictly increasing sequence of `(last, rnd)`
-pairs and no two calls derive the same pair. The reference implementation serializes with a
-process-wide mutex; any mechanism providing the same serialization is acceptable.
+All reads and writes of a generator's state, and the derivation of the emitted values from it,
+MUST be serialized. In the random profile the state is `last` and `rnd`, and concurrent calls
+MUST observe a strictly increasing sequence of `(last, rnd)` pairs with no two calls deriving
+the same pair; in the fixed-discriminator profile of Section 6.6 the state is `last` alone, and
+concurrent calls MUST observe a strictly increasing sequence of `last` values with no two calls
+deriving the same value. The reference implementation gives each generator a mutex of its own,
+so its package-level generator is serialized process-wide because it is one instance per
+process, not because the mutex is; any mechanism providing the same serialization is
+acceptable.
 
 The serialization scope defines the uniqueness scope. Identifiers from two generator instances,
 whether in one process or in different processes, are not coordinated.
 
 ### 6.4. Random Field Source
+
+This section applies to the random profile. A generator running the fixed-discriminator
+profile of Section 6.6 calls no `random16()` and is bound by none of the requirements below:
+the value it writes into octets 8..9 comes from its configuration rather than from a draw.
 
 `random16()` MUST return values uniformly distributed over 0 to 65535.
 
@@ -519,14 +548,90 @@ them is claimed at or beyond that boundary.
   increment branch. A generator whose clock is wrong in that direction keeps emitting valid,
   strictly increasing identifiers, and resumes tracking the clock once the clock passes `last`.
 
-Across generators, uniqueness is probabilistic. Two identifiers carrying the same timestamp
-collide if and only if their random fields are equal, which for two independent draws has
-probability 2^-16. Because identifiers after the first in a nanosecond are consecutive rather
-than independent, each generator covers a run of consecutive random-field values, and two
-generators emitting `k` identifiers each within the same nanosecond produce a colliding pair
-with probability (2k-1)/2^16 for k up to 2^15, and with certainty for larger k, where the two
-runs together cover the whole field. A generator cannot stay in one nanosecond beyond 2^16
-identifiers in any case: the wrap branch advances the timestamp.
+Across generators in the random profile, uniqueness is probabilistic. Two identifiers carrying
+the same timestamp collide if and only if their random fields are equal, which for two
+independent draws has probability 2^-16. Because identifiers after the first in a nanosecond
+are consecutive rather than independent, each generator covers a run of consecutive
+random-field values, and two generators emitting `k` identifiers each within the same
+nanosecond produce a colliding pair with probability (2k-1)/2^16 for k up to 2^15, and with
+certainty for larger k, where the two runs together cover the whole field. A generator cannot
+stay in one nanosecond beyond 2^16 identifiers in any case: the wrap branch advances the
+timestamp.
+
+Across generators in the fixed-discriminator profile of Section 6.6 the arithmetic is
+replaced by a configuration rule. Identifiers from two generators holding different node
+identifiers differ in octets 8..9 and therefore never collide, whatever their clocks do: an
+operator who assigns distinct node identifiers gets exact rather than probabilistic uniqueness
+across those generators, which is the whole point of the profile. Two generators holding the
+same node identifier are the opposite case. They do not merely risk a collision; any two
+identifiers they emit under the same timestamp are identical, deterministically, since
+nothing remains to distinguish them. Such a configuration MUST NOT be used: every generator
+running at a given time MUST hold a node identifier no other one holds.
+
+Uniqueness across incarnations of one node is conditional in that profile. A generator starts
+with `last` = 0 and takes its first timestamp from the clock, so a restarted node that emits a
+timestamp its previous incarnation already emitted reproduces that identifier exactly, and a
+clock at or below the largest timestamp that incarnation used risks re-emitting identifiers it
+already produced. The random profile absorbs this case in the 2^-16 term above; the fixed
+profile has no such term, and its uniqueness across restarts holds only if the first timestamp
+a new incarnation emits is strictly greater than the largest timestamp already emitted under
+that node identifier. That is a condition on the deployment, not something a generator can
+check, and this document does not prescribe how to hold it; persisting the last emitted
+timestamp across restarts is one way.
+
+### 6.6. Fixed-Discriminator Profile (Optional)
+
+A generator MAY be configured with a node identifier: an unsigned 16-bit value the operator
+assigns to it, constant for the life of the generator. A generator so configured runs the
+profile of this section in place of Sections 6.2 and 6.4.
+
+Its state is `last` as defined in Section 6.1 and nothing else: it holds no `rnd`, and `node`
+below is the configured identifier, fixed for the life of the generator, not state the
+algorithm updates. `now` is read as in Section 6.2, under the same clamp of a pre-epoch
+reading.
+
+```
+function next_fixed(now):
+    begin exclusive access to last
+
+    if now > last:
+        last = now
+    else:
+        last = last + 1
+
+    t = last
+
+    end exclusive access
+
+    octets[0..7]   = t as unsigned 64-bit big-endian
+    octets[8..9]   = node as unsigned 16-bit big-endian
+    octets[10..11] = crc16(octets[0..9]) as unsigned 16-bit big-endian
+
+    if octets, as a 96-bit unsigned integer, are not below 62^16:
+        emit nothing, see Section 6.2.1
+
+    return octets
+```
+
+Every identifier the generator emits carries `node` unchanged in octets 8..9. As in Section
+6.2 the emitted timestamp is `last` after the update, and a generator MUST NOT emit `now` when
+`now` is less than or equal to `last`. The serialization requirement of Section 6.3 applies
+unchanged, over `last` alone, and so does the exhaustion rule of Section 6.2.1. What this
+profile does and does not give across generators, and the constraint on assigning `node`, are
+stated in Section 6.5.
+
+The four properties of Section 6.5 hold here by a shorter argument than the one given there:
+every call raises `last`, either to a larger clock reading or by one, so the emitted pair
+`(last, node)` strictly increases with `node` fixed, no pair is emitted twice, a backward clock
+jump of any size takes the increment branch, and a pre-epoch reading clamped to 0 never
+exceeds `last`.
+
+The field costs throughput against the clock. The random profile separates up to 2^16
+identifiers inside one nanosecond; this profile has nothing to separate them with, so every
+identifier after the first in a nanosecond spends one nanosecond of the timestamp. A generator
+sustaining more than 10^9 identifiers per second runs `last` ahead of its clock and stays
+ahead until the clock catches up. Those identifiers are valid and ordered; their timestamps
+are early, in the same way Section 6.5 describes for a sustained rollback.
 
 ## 7. Ordering and Comparison
 
@@ -555,6 +660,13 @@ generators, the order is timestamp order, and is therefore only as meaningful as
 between the clocks involved; identifiers sharing a timestamp are ordered by their random
 fields, which carry no temporal meaning. Implementations MUST NOT derive a happens-before
 relation between identifiers from different generators.
+
+Under the fixed-discriminator profile of Section 6.6 that last point is sharper. Identifiers
+from different nodes sharing a timestamp are ordered by node identifier, so the order inside a
+same-timestamp group is the operator's numbering: stable, reproducible, and carrying no
+temporal meaning whatever. Reading a lower node identifier as "earlier" is the same error as
+reading a lower random field that way. The three comparisons above still agree with each
+other, as they do for any two valid identifiers.
 
 Storing the canonical text in a database preserves this order only under a binary or code-point
 collation. Under any other collation the index order is whatever that collation defines.
@@ -605,13 +717,21 @@ Appendix A.
 
 ### 9.3. Generator Conformance
 
-A generator MUST implement Section 6.2 with the state of Section 6.1, MUST serialize state
-access per Section 6.3, MUST draw the random field per Section 6.4, and MUST clamp a pre-epoch
-clock reading per Section 6.2. Every identifier it emits MUST be one a conforming decoder
-accepts, and it MUST provide the within-generator
-monotonicity and uniqueness properties of Section 6.5 for every call up to the exhaustion
-boundary of Section 6.2.1. At that boundary it MUST stop emitting rather than emit an
+A generator conforms in one of the two profiles of Section 6 and MUST state which one it
+implements. Under either profile it MUST hold `last` per Section 6.1, MUST serialize state
+access per Section 6.3, and MUST clamp a pre-epoch clock reading per Section 6.2. Every
+identifier it emits MUST be one a conforming decoder accepts, and it MUST provide the
+within-generator monotonicity and uniqueness properties of Section 6.5 for every call up to the
+exhaustion boundary of Section 6.2.1. At that boundary it MUST stop emitting rather than emit an
 identifier a conforming decoder would reject; how it reports the exhaustion is unconstrained.
+
+Under the random profile it MUST additionally implement the algorithm of Section 6.2 with the
+`rnd` state of Section 6.1 and draw that field per Section 6.4. Under the fixed-discriminator
+profile it MUST additionally implement the algorithm of Section 6.6. Every 16-bit value is a
+legal node identifier there; a generator MUST NOT reserve any of them, and keeping the
+identifiers of concurrently running generators distinct is the operator's obligation under
+Section 6.5. An implementation MAY offer both profiles; a single generator runs exactly one of
+them, fixed when it is created.
 
 The reference implementation does not implement that stop, as Section 6.2.1 records. An
 implementation that copies its behavior at the boundary is conforming everywhere below the
@@ -642,9 +762,15 @@ A µID is an identifier, not a secret, and not a capability.
 - **No cross-generator ordering guarantee.** Ordering between identifiers from different
   generators depends on the agreement of independent clocks and MUST NOT be treated as a
   causal or audit-grade ordering.
-- **No embedded identity.** The format contains no node, host, or process identifier, so it
-  leaks none; the same property is why cross-generator uniqueness is probabilistic
-  (Section 6.5) rather than guaranteed.
+- **No embedded identity by default.** Under the random profile the format contains no node,
+  host, or process identifier, so it leaks none; the same property is why cross-generator
+  uniqueness is probabilistic (Section 6.5) rather than guaranteed. The fixed-discriminator
+  profile of Section 6.6 embeds an identity the operator assigned openly: every identifier a
+  node emits carries that node's number in the clear, so anyone holding a set of identifiers
+  can group them by node, count the nodes, and follow one node's output over time. No privacy
+  property is claimed for that number: it is not a secret, it is not obscured, and 16 bits are
+  trivially enumerable. Where identifiers must not be linkable by origin, that profile MUST NOT
+  be used.
 
 ## 11. IANA Considerations
 
@@ -665,8 +791,10 @@ a name distinct from both spellings. It MUST NOT be published as a revision of t
 and implementations MUST NOT attempt to distinguish it from this format at runtime, because no
 field is available to signal it.
 
-Revisions of this document MAY correct errors, sharpen wording, and add test vectors, and MUST
-leave the encoding unchanged and the set of accepted inputs no smaller.
+Revisions of this document MAY correct errors, sharpen wording, add test vectors, and add
+generator profiles, and MUST leave the encoding unchanged and the set of accepted inputs no
+smaller. Revision 3 added the profile of Section 6.6 under that rule: it changes what a
+generator MAY put in octets 8..9, and nothing about what a decoder accepts.
 
 ### 12.1. Relationship to the Previous Rules (Informative)
 

@@ -7,10 +7,11 @@ case-sensitive, and the binary form orders the same way, so a µID works as a pr
 still gives chronological ordering from a plain index scan. Every code artifact is ASCII: the
 module path `github.com/vshuraeff/muid`, the package `muid`, and the `muid` binary.
 
-Throughout, "creation order" means creation order within one generating process, where it is
-exact. Ids from different processes sort by their embedded timestamps, so their relative
-order is only as good as the agreement between those clocks, and ids created in the same
-nanosecond sort by a random field that carries no temporal meaning.
+Throughout, "creation order" means creation order within one generator, where it is exact;
+the package-level `New` is a single generator per process. Ids from different generators sort
+by their embedded timestamps, so their relative order is only as good as the agreement
+between those clocks, and ids created in the same nanosecond sort by a random field that
+carries no temporal meaning.
 
 ```
 9yrSO26OoIfbvR9t
@@ -29,7 +30,7 @@ back a plausible-looking wrong one.
 
 Compared with a UUIDv7 it is under half the string length (16 characters against 36),
 timestamps to the nanosecond rather than the millisecond, is strictly monotonic within the
-generating process, and carries an integrity check.
+generator that produced it, and carries an integrity check.
 
 ## Install
 
@@ -64,6 +65,44 @@ fmt.Println(id)           // String() is the canonical 16-character form
 fmt.Println(id.Time())    // the encoded timestamp, nanosecond precision
 fmt.Println(id.IsZero())  // false
 ```
+
+### Generate with a node id
+
+`New` draws the 16-bit random field, which is what makes uniqueness across processes
+probabilistic. Where the nodes that generate ids can be numbered by whoever deploys them,
+`NewNodeGenerator` puts that number in the field instead of a random draw, and ids from
+differently numbered nodes then cannot collide at all:
+
+```go
+gen := muid.NewNodeGenerator(node) // node is a uint16 the operator assigns
+
+id := gen.New()      // muid.Muid, carrying node in bytes 8..9
+s := gen.NewString() // a further id from the same generator, as canonical text
+```
+
+Every id from `gen` carries `node` where a random field would be, so the generator has
+nothing left to separate ids created in one nanosecond: it advances the timestamp by one
+nanosecond per id instead of walking a range of 65536 random values. It stays strictly
+monotonic and unique within itself, and above $`10^9`$ ids per second its timestamps run
+ahead of the clock until the clock catches up.
+
+Two live generators must never share a node id. They would not merely risk a collision: any
+two of their ids that carry the same timestamp are byte-identical. Across a restart of one
+node, uniqueness holds only if the first id after the restart carries a timestamp strictly
+greater than the largest one that node emitted before it — an equal timestamp reproduces an
+id the previous incarnation already emitted.
+
+> [!WARNING]
+> Do not derive the node id by hashing a hostname, a pod name, or a pid. Hashing does not
+> reduce the expected number of collisions; it converts an occasional collision into a
+> permanent one, because two nodes whose names hash to the same 16-bit value duplicate each
+> other's ids on every shared timestamp for as long as both run. With 100 nodes, the chance
+> that some pair shares a hash is 7.3%. A node id has to come from a source that is unique by
+> construction: a StatefulSet ordinal, a per-instance config value, or a central assignment.
+> That is why this package ships no hashing helper.
+
+The node id is not a secret: every id a node emits carries it in the clear, so anyone holding
+a few ids can tell which of them came from the same node.
 
 ### Parse
 
@@ -201,7 +240,7 @@ documented in [POSTGRES.md](POSTGRES.md).
 | Alphabet        | `0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz`    |
 | Case            | significant; no aliases and no normalization                        |
 | Time resolution | nanoseconds, through 2321-09-25T13:06:13.925556393Z                 |
-| Ordering        | binary, text, and numeric order agree; process-local creation order |
+| Ordering        | binary, text, and numeric order agree; creation order per generator |
 
 Bit layout, most significant bit first:
 
@@ -245,14 +284,17 @@ every identifier valid under those rules is still valid and still encodes to the
 
 ## Guarantees
 
-- **Strictly monotonic and unique within a process**, including across a clock rollback.
-  Generation is serialized: when the clock does not advance past the last value used, the
-  random field is incremented instead, and if that field wraps, the timestamp is nudged
-  forward by one nanosecond. Two calls in the same process never return the same value and
-  never return a value that sorts before an earlier one, whatever the wall clock does.
+- **Strictly monotonic and unique within one generator**, including across a clock rollback.
+  `New` is a single generator shared by the whole process, so for it that scope is the
+  process. Generation is serialized: when the clock does not advance past the last value used,
+  the random field is incremented instead, and if that field wraps, the timestamp is nudged
+  forward by one nanosecond. Two calls on one generator never return the same value and never
+  return a value that sorts before an earlier one, whatever the wall clock does.
 - **Probabilistic across processes**: roughly a $`2^{-16}`$ chance of collision per pair of
   ids generated in the same nanosecond by different processes, which do not coordinate. Their
-  relative ordering also depends on their clocks being in agreement.
+  relative ordering also depends on their clocks being in agreement. Numbering the nodes with
+  [`NewNodeGenerator`](#generate-with-a-node-id) removes that chance between distinctly
+  numbered nodes, at the cost of coordinating the numbers.
 
 That $`2^{-16}`$ is a deliberate trade. Schemes with a large random component buy longer
 odds by spending bits; µID spends its bits on a nanosecond timestamp, a 16-character text
@@ -273,8 +315,12 @@ random field.
 - **Nanoseconds are the storage unit, not a guaranteed clock resolution.** The value is as
   precise as `time.Now` on the host, which on many platforms is coarser than a nanosecond;
   treat `Time()` as an ordering key with a timestamp attached, not as a measurement.
-- **No embedded machine or process identity.** There is no node id to configure and none to
-  leak, which is also why cross-process uniqueness is probabilistic rather than guaranteed.
+- **No embedded machine or process identity by default.** `New` has no node id to configure
+  and none to leak, which is also why its cross-process uniqueness is probabilistic rather
+  than guaranteed. `NewNodeGenerator` is the opt-in exception: the node id it embeds is
+  assigned openly and travels in the clear, so ids from one node are linkable by anyone who
+  collects them. It is not obscured, and 16 bits are trivially enumerable, so no privacy
+  property is claimed for it. Where that linkability is unacceptable, stay on `New`.
 
 ## Comparison
 
@@ -287,7 +333,7 @@ not contain. Measured timings, for µID only, follow it.
 | Text length                      | 16             | 36               | 36                  | 26               | 20                      | 27                  |
 | Timestamp precision              | nanoseconds    | none             | milliseconds        | milliseconds     | seconds                 | seconds             |
 | Text sorts by time               | yes            | no               | yes                 | yes              | yes                     | yes                 |
-| In-process monotonic[^monotonic] | guaranteed     | no               | optional (RFC 9562) | optional (spec)  | counter within a second | optional (Sequence) |
+| In-process monotonic[^monotonic] | per generator  | no               | optional (RFC 9562) | optional (spec)  | counter within a second | optional (Sequence) |
 | Checksum                         | CRC-16         | none             | none                | none             | none                    | none                |
 | Host/process field               | none           | none             | none                | none             | machine id + pid        | none                |
 | Case handling                    | case-sensitive | case-insensitive | case-insensitive    | case-insensitive | case-sensitive          | case-sensitive      |
@@ -318,9 +364,11 @@ registry.
   outside the alphabet anywhere, a ULID whose leading character overflows 128 bits, a bad
   UUID version or variant nibble in a strict parser — but most single-character mutations
   decode as a different, equally valid id. With µID they yield an error.
-- Embedding no host or process identity means there is nothing to configure and nothing to
-  leak; the price is that cross-process uniqueness is probabilistic, which the
-  [Guarantees](#guarantees) section states in full.
+- Embedding no host or process identity by default means there is nothing to configure and
+  nothing to leak; the price is that cross-process uniqueness is probabilistic, which the
+  [Guarantees](#guarantees) section states in full. The table row states that default; a
+  generator from `NewNodeGenerator` carries an operator-assigned node id in the same 16 bits,
+  where xid always carries a machine id and a pid.
 - Case sensitivity means one text spelling per value: µID has no aliases and no
   normalization, so `Parse(s).String() == s` and two equal ids are always equal as text. UUID
   hex and ULID's Crockford base32 are case-insensitive, so one value has several spellings
@@ -348,7 +396,9 @@ spare capacity.[^others]
 </details>
 
 [^monotonic]: The monotonic row counts what each format's specification or reference
-    implementation offers.
+    implementation offers. µID's is not optional, but it is scoped to one generator: the
+    package-level `New` is a single generator per process, and generators from
+    `NewNodeGenerator` are coordinated neither with it nor with each other.
 
 [^bench]: Measured on an Intel Core i9-9900K, Go 1.26, `darwin/amd64`, via
     `go test -bench=Benchmark -benchmem -run=NoTests -count=3 .`
