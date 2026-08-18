@@ -441,7 +441,8 @@ past the bound of Section 2.6. The value never lands on the bound: a generated i
 always carries the checksum of its own first ten octets, and the bound's first ten octets
 checksum to 0x633C while its last two octets are 0x0000. Exhaustion is therefore the first call
 whose composed value would exceed the bound, not a call that reaches it. From that call on no
-further identifier can be produced, since Section 5.2 rejects everything at or above the bound.
+further identifier can be produced, since Section 5.2 rejects every value that is not below the
+bound.
 
 Because the bound constrains the composed value, exhaustion is a property of the identifier
 about to be emitted, not of the timestamp alone: at the largest timestamp the generator runs out
@@ -580,7 +581,7 @@ random field of 0xDE00 or below, whatever the checksum turns out to be. With ran
 the largest usable timestamp is one nanosecond lower, 11099595973925556392. The bound
 constrains the composed value; no field has a range of its own.
 
-A generator whose next identifier would fall at or above the bound can produce no further
+A generator whose next identifier would fall above the bound can produce no further
 identifiers, and Section 6.2.1 states what it MUST NOT do there.
 
 ## 9. Conformance
